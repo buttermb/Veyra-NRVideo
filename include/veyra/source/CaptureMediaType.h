@@ -23,6 +23,35 @@ struct CaptureMediaLayout {
     unsigned planes=1,chromaStride=0,chromaRowBytes=0;
     size_t chromaOffset=0,secondChromaOffset=0;
 };
+
+// Some native pins drop the color flags in ConnectionMediaType even though
+// GetFormat supplied them for that very connection. Recover only missing SDR
+// fields from the same byte layout. Explicit connected fields still win.
+inline bool retainConfiguredSdrColor(CaptureMediaLayout& connected, const CaptureMediaLayout& configured) {
+    if (!(configured.colorControlFlags & AMCONTROL_COLORINFO_PRESENT) ||
+        connected.format != configured.format || connected.packing != configured.packing ||
+        connected.width != configured.width || connected.height != configured.height ||
+        connected.stride != configured.stride || connected.sampleBytes != configured.sampleBytes ||
+        connected.duration != configured.duration || connected.bottomUp != configured.bottomUp ||
+        connected.color.isHdrPath() || configured.color.isHdrPath()) return false;
+
+    auto& color = connected.color;
+    const auto& source = configured.color;
+    const auto retain = [](auto& value, bool& assumed, auto configuredValue, bool configuredAssumed) {
+        if (!assumed || configuredAssumed || configuredValue == decltype(configuredValue){}) return false;
+        value = configuredValue;
+        assumed = false;
+        return true;
+    };
+    bool retained = retain(color.range, color.rangeAssumed, source.range, source.rangeAssumed);
+    retained |= retain(color.matrix, color.matrixAssumed, source.matrix, source.matrixAssumed);
+    retained |= retain(color.primaries, color.primariesAssumed, source.primaries, source.primariesAssumed);
+    if (retain(color.transfer, color.transferAssumed, source.transfer, source.transferAssumed)) {
+        color.preserveSdrCodeValues = source.preserveSdrCodeValues;
+        retained = true;
+    }
+    return retained;
+}
 // Walk the AM_MEDIA_TYPE's format block without assuming VideoInfo vs
 // VideoInfo2; used to read/rewrite the DIB orientation flag in place.
 inline BITMAPINFOHEADER* captureBitmapHeader(AM_MEDIA_TYPE& type){

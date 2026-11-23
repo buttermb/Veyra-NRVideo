@@ -306,6 +306,8 @@ bool PresentSink::initialize(ID3D12Device* device, ID3D12CommandQueue* queue,
     // New swap chain: present ids restart; VEYRA_TEST_NO_DISPLAY_STATS=1 disables the samples.
     displayLatencyEnabled_=GetEnvironmentVariableW(L"VEYRA_TEST_NO_DISPLAY_STATS",nullptr,0)==0;
     pendingPresents_={};lastDisplayedPresent_=0;lastSyncRefresh_=0;lastPresentRefresh_=0;replacedPresents_=0;lastSyncQpc_=0;refreshQpc_=0;displayLatencyMs_.clear();
+    for(auto& values:captureDisplayLatencyMs_)values.clear();
+    captureFlipGaps_={};
     log::info("display-refresh",std::format("monitor refresh={:.3f} Hz at swapchain creation (0 = unknown); submissions above this rate cannot all be scanned out",displayRefreshHz_));
     log::info("present", std::format("present-sink: window {}x{} swapEffect={} buffers=3 vsync={} tearing={} captureCompatible={} (capture not verified)",
         width_, height_, actual.SwapEffect==DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL?"flip-sequential":"flip-discard", desc_.vsync ? 1 : 0, (desc_.tearing && tearingSupported_) ? 1 : 0, desc.captureCompatible));
@@ -365,7 +367,7 @@ ID3D12Resource* PresentSink::currentBackBuffer(uint32_t* acquiredIndex)
     return backBuffers_[backBufferIndex_].Get();
 }
 
-bool PresentSink::present(Status& status)
+bool PresentSink::present(Status& status, int64_t captureCallback100ns, bool generated)
 {
     using Clock=std::chrono::steady_clock;
     auto begin=Clock::now();
@@ -388,7 +390,7 @@ bool PresentSink::present(Status& status)
     presentTiming_.callMs=split();presentTiming_.result=hr;
     UINT presentId=0;
     if(SUCCEEDED(hr)&&trackScanout&&SUCCEEDED(swapChain_->GetLastPresentCount(&presentId)))
-        pendingPresents_[pendingPresentNext_++%pendingPresents_.size()]={presentId,presentQpc.QuadPart,syncInterval==0};
+        pendingPresents_[pendingPresentNext_++%pendingPresents_.size()]={presentId,presentQpc.QuadPart,captureCallback100ns,syncInterval==0,generated};
     if(presentContractDirty_||attemptedPresentCount_<=3||attemptedPresentCount_%120==0){
         log::info("present-contract",std::format("backend={} sync={} flags=0x{:X} hr=0x{:X}",xess_?"XeSS":"DXGI",syncInterval,flags,unsigned(hr)));
         presentContractDirty_=false;
@@ -484,6 +486,7 @@ void PresentSink::sampleDisplayLatency(){
     lastSyncQpc_=stats.SyncQPCTime.QuadPart;lastSyncRefresh_=stats.SyncRefreshCount;
     if(stats.PresentCount==lastDisplayedPresent_)return;
     const UINT previous=lastDisplayedPresent_;
+    const UINT previousRefresh=lastPresentRefresh_;
     lastDisplayedPresent_=stats.PresentCount;
     // One refresh shows one new present, so presents beyond the refreshes
     // between two shown frames were replaced unseen: Present(0,0) loses them
@@ -515,6 +518,19 @@ void PresentSink::sampleDisplayLatency(){
         const double ms=(scanout-double(stats.PresentCount-pending.id)*period-double(pending.qpc))*1000.0/frequency;
         if(pending.id==stats.PresentCount&&ms>=0&&ms<1000)latchMs_=std::min(latchMs_+.001,ms);
         if(ms>=0&&ms<1000&&displayLatencyMs_.size()<4096)displayLatencyMs_.push_back(ms);
+        // Only the present named by DXGI has a corresponding vblank timestamp.
+        // For an interpolated frame, measure from the newer source callback.
+        if(pending.id==stats.PresentCount&&ms>=0&&pending.captureCallback100ns>0){
+            const double ageMs=(scanout*1e7/frequency-double(pending.captureCallback100ns))/10000;
+            auto& capture=captureDisplayLatencyMs_[size_t(pending.generated)];
+            if(ageMs>=0&&ageMs<1000&&capture.size()<4096){
+                capture.push_back(ageMs);
+                if(!pending.replaceable&&previous&&stats.PresentCount-previous==1&&stats.PresentRefreshCount>previousRefresh){
+                    const UINT gap=stats.PresentRefreshCount-previousRefresh;
+                    ++captureFlipGaps_[std::min(gap,4u)-1];
+                }
+            }
+        }
     }
 }
 PresentSink::RefreshGrid PresentSink::refreshGrid()const{
@@ -535,6 +551,21 @@ PresentSink::DisplayLatencySummary PresentSink::takeDisplayLatency(){
         summary.p95Ms=values[std::min(values.size()-1,(values.size()*95+99)/100-1)];summary.maxMs=values.back();
         values.clear();
     }
+    const auto takeCapture=[](std::vector<double>& capture){
+        DisplayLatencySummary::CaptureTiming timing;
+        if(!capture.empty()){
+            std::sort(capture.begin(),capture.end());
+            timing.samples=capture.size();
+            timing.p50Ms=capture[(capture.size()-1)/2];
+            timing.p95Ms=capture[(capture.size()*95+99)/100-1];
+            capture.clear();
+        }
+        return timing;
+    };
+    summary.realCapture=takeCapture(captureDisplayLatencyMs_[0]);
+    summary.generatedCapture=takeCapture(captureDisplayLatencyMs_[1]);
+    summary.captureFlipGaps=captureFlipGaps_;
+    captureFlipGaps_={};
     ComPtr<IDXGISwapChainMedia> media;
     DXGI_FRAME_STATISTICS_MEDIA statistics{};
     if(displayLatencyEnabled_&&!xess_&&swapChain_&&SUCCEEDED(swapChain_.As(&media))&&SUCCEEDED(media->GetFrameStatisticsMedia(&statistics)))

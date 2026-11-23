@@ -91,7 +91,7 @@ public:
 
     // Presents the current back buffer. Returns false on device-lost class
     // failures (caller must trigger recovery).
-    bool present(Status& status);
+    bool present(Status& status, int64_t captureCallback100ns = 0, bool generated = false);
     struct PresentTiming {
         double beforeMs=0,callMs=0,bufferMs=0,afterMs=0;
         HRESULT result=S_OK;
@@ -130,9 +130,15 @@ public:
     // compositionMode: DXGI_FRAME_PRESENTATION_MODE (0 composed, 1 overlay,
     // 2 none, 3 composition failure), -1 when the query is unavailable.
     struct DisplayLatencySummary {
+        struct CaptureTiming {
+            size_t samples=0;
+            double p50Ms=-1,p95Ms=-1;
+        };
         uint64_t samples=0,replacedAtLeast=0;
         double p50Ms=-1,p95Ms=-1,maxMs=-1;
         int compositionMode=-1;
+        CaptureTiming realCapture, generatedCapture;
+        std::array<uint32_t,4> captureFlipGaps{}; // 1, 2, 3 or 4+ refreshes between consecutive shown frames
     };
     DisplayLatencySummary takeDisplayLatency();
     // Host 100 ns (steady_clock). The last vblank in the frame statistics and the
@@ -224,7 +230,11 @@ private:
     void sampleDisplayLatency();
     // replaceable: Present(0,0); only the frame a later sample names as shown
     // is dated, a newer present may have replaced the ones in between.
-    struct PendingPresent { UINT id=0; int64_t qpc=0; bool replaceable=false; };
+    struct PendingPresent {
+        UINT id=0;
+        int64_t qpc=0, captureCallback100ns=0;
+        bool replaceable=false, generated=false;
+    };
     std::array<PendingPresent,16> pendingPresents_{};
     unsigned pendingPresentNext_=0;
     UINT lastDisplayedPresent_=0,lastSyncRefresh_=0,lastPresentRefresh_=0;
@@ -233,6 +243,8 @@ private:
     double refreshQpc_=0,latchMs_=2;
     bool displayLatencyEnabled_=true;
     std::vector<double> displayLatencyMs_;
+    std::array<std::vector<double>,2> captureDisplayLatencyMs_;
+    std::array<uint32_t,4> captureFlipGaps_{};
 };
 
 } // namespace veyra::gfx

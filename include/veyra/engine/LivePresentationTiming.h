@@ -29,6 +29,40 @@ inline int64_t capturePairInterval100ns(pipeline::Rational duration,double nomin
 // FG present when ready: one PTS anchor per epoch turned the first sample's late
 // read into a hold on every later frame (60 fps window capture: 3-52 ms per run).
 inline bool livePacesSourcePts(bool fg,bool physicalCapture,bool screenCapture){return fg||!(physicalCapture||screenCapture);}
+
+// A one-frame synchronized queue can space an ordered 2X pair itself when
+// the source cadence and the fixed refresh agree. Check the measured cadence
+// and the individual pair so an irregular source retains its PTS pacing.
+inline bool liveRefreshPacesPair(double contentFps, double refreshHz, int64_t pairInterval100ns) {
+    if (!std::isfinite(contentFps) || !std::isfinite(refreshHz) ||
+        contentFps <= 0 || refreshHz <= 0 || pairInterval100ns <= 0) return false;
+    const double displayPairInterval = 20000000.0 / refreshHz;
+    return std::abs(2 * contentFps - refreshHz) <= refreshHz * .005 &&
+        std::abs(double(pairInterval100ns) - displayPairInterval) <= displayPairInterval * .03;
+}
+// At least two physical flips per output frame leave a spare synchronized
+// opportunity for an original. Allow for a 59.94/60 clock mismatch at 120 Hz.
+inline bool liveFastPairDisplay(double outputFps,double refreshHz){
+    return std::isfinite(outputFps)&&std::isfinite(refreshHz)&&outputFps>0&&
+        refreshHz>=2*outputFps*.995;
+}
+// A displayed intermediate earns its half-interval on screen. A gap in source
+// timestamps cannot make that interval longer than the requested output period.
+// The following original must be eligible by the next nominal input callback.
+inline int64_t liveFastPairOriginalDue(int64_t callback,int64_t generatedSubmit,int64_t ptsToOriginal,
+                                      int64_t outputPeriod,double refreshHz=0){
+    if(callback<=0||generatedSubmit<callback||outputPeriod<=0)return generatedSubmit;
+    auto hold=std::clamp(ptsToOriginal,int64_t{0},outputPeriod);
+    if(hold>=outputPeriod*.97&&liveFastPairDisplay(1e7/outputPeriod,refreshHz)){
+        // A 144 Hz monitor offers 2.4 flips per 60 FPS frame. Two flips are
+        // closer to the intended midpoint than three. Returning the original
+        // at that boundary leaves the remaining flips for the next input pair.
+        const double refreshPeriod=1e7/refreshHz;
+        const auto nearest=std::round(hold/refreshPeriod);
+        hold=std::min(hold,int64_t(std::llround(nearest*refreshPeriod)));
+    }
+    return std::min(generatedSubmit+hold,callback+2*outputPeriod);
+}
 // Live capture never waits on an absolute source PTS. Once B is available,
 // display generated(A,B), then B up to half an input interval later. Anchor
 // each pair to current host time, not to the first (possibly stale) sample.
@@ -132,5 +166,12 @@ inline double liveHalfRateCapacityWaitMs(double baseMs,double outputIntervalMs,d
     if(refreshMs<=0||outputIntervalMs<1.8*refreshMs)return usual;
     const double slack=std::clamp(untilRealMs-refreshMs-0.5,0.0,refreshMs);
     return std::min(std::max(baseMs,slack),outputIntervalMs/2);
+}
+// In a matched, two-refresh capture pair the next input arrives about two
+// refreshes after B. Reserve the second refresh for the original and subtract
+// time already spent processing B from the generated frame's capacity wait.
+inline double liveMatchedPairCapacityWaitMs(double refreshMs,double callbackAgeMs){
+    if(!std::isfinite(refreshMs)||!std::isfinite(callbackAgeMs)||refreshMs<=0||callbackAgeMs<0)return 0;
+    return std::max(0.0,refreshMs-callbackAgeMs-0.5);
 }
 }

@@ -844,6 +844,7 @@ static int runApplication(int argc, char** argv, QString& restartProgram, QStrin
     //   --video-probe <normal|hidden|no-region|covers-only>  native-window diagnosis
     const QStringList args = QCoreApplication::arguments();
     QString openPath;
+    bool startFullscreen = false;
     QVariantMap testOptions;
     if (updateProbe) testOptions.insert(QStringLiteral("portableUpdateProbe"), true);
     if(qEnvironmentVariableIsSet("VEYRA_TEST_DISABLE_PAUSED_UI_IDLE"))
@@ -871,6 +872,8 @@ static int runApplication(int argc, char** argv, QString& restartProgram, QStrin
         } else if (a == QLatin1String("--export-out") && hasValue) {
             // A review run's export target, so a real export starts without the dialog.
             bridge.setExportPath(args.at(++i));
+        } else if (a == QLatin1String("--fullscreen")) {
+            startFullscreen = true;
         } else if (a == QLatin1String("--full-bar") && hasValue) {
             testOptions.insert(QStringLiteral("fullBar"), args.at(++i));
         } else if (a == QLatin1String("--full-debug")) {
@@ -966,6 +969,7 @@ static int runApplication(int argc, char** argv, QString& restartProgram, QStrin
                                             testSize.width(), testSize.height()));
     veyra::log::info("qml-window", std::format("probe mode={}", videoProbeName()));
     engine.rootContext()->setContextProperty(QStringLiteral("vyTest"), testOptions);
+    engine.rootContext()->setContextProperty(QStringLiteral("vyStartFullscreen"), startFullscreen);
     if (!openPath.isEmpty() && !updateProbe) {
         QTimer::singleShot(600, &bridge, [&bridge, openPath] { bridge.openPath(openPath); });
     } else if (!updateProbe) {

@@ -1256,7 +1256,10 @@ bool CaptureCardSource::configure(const SourceOpenDesc& desc){close();error_.cle
         p.layout.color.rangeAssumed=p.layout.color.matrixAssumed=p.layout.color.transferAssumed=true;
         layoutValid=true;
     }else{
-        freeType(native);layoutValid=SUCCEEDED(hr)&&captureMediaLayout(connected,p.layout);freeType(&connected,false);
+        layoutValid=SUCCEEDED(hr)&&captureMediaLayout(connected,p.layout);
+        if(layoutValid&&direct&&retainConfiguredSdrColor(p.layout,nativeLayout))
+            log::info("capture-color","restored missing SDR color metadata from the matching configured native format");
+        freeType(native);freeType(&connected,false);
     }
     if(!layoutValid){log::error("capture",std::format("unsupported negotiated layout/connect failure hr=0x{:08X}",uint32_t(hr)));if(error_.empty())error_=std::format(L"采集卡无法连接所选格式（0x{:08X}），请检查设备占用并重新选择。",uint32_t(hr));return false;}
     if(p.cpuUnpack&&captureLegacyCpuLayout(p.layout))log::warn("capture-unpack",std::format("legacy CPU unpack path active packing={} format={} (per-pixel conversion stays on the callback thread)",int(p.layout.packing),int(p.layout.format)));

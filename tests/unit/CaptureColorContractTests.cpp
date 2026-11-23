@@ -56,6 +56,21 @@ int main(){
     auto resolved=pipeline::resolveFrameColor(*frame,layout.color);check(resolved.transfer==pipeline::TransferFunction::SRGB&&resolved.transferAssumed&&resolved.range==pipeline::ColorRange::Full,"source contract survives graph resolution");
     ext.VideoTransferFunction=DXVA2_VideoTransFunc_709;vi.dwControlFlags=ext.value|AMCONTROL_COLORINFO_PRESENT;
     check(source::captureMediaLayout(type,layout)&&layout.color.preserveSdrCodeValues&&!layout.color.transferAssumed&&pipeline::workingTransferCode(layout.color)==1,"explicit BT709 metadata retained; working decode reverses the SDR sink encode");
+    const auto configuredSdr = layout;
+    vi.dwControlFlags = 0;
+    source::CaptureMediaLayout connectedSdr;
+    check(source::captureMediaLayout(type,connectedSdr)&&source::retainConfiguredSdrColor(connectedSdr,configuredSdr)&&
+        connectedSdr.color.range==pipeline::ColorRange::Full&&!connectedSdr.color.rangeAssumed&&
+        connectedSdr.color.matrix==pipeline::YuvMatrix::BT709&&connectedSdr.color.preserveSdrCodeValues,
+        "a native pin with missing flags keeps the same format's configured SDR range and matrix");
+    const auto recoveredSdr = connectedSdr;
+    connectedSdr.color.range = pipeline::ColorRange::Limited;
+    check(!source::retainConfiguredSdrColor(connectedSdr,configuredSdr)&&
+        connectedSdr.color.range==pipeline::ColorRange::Limited,"configured flags cannot override explicit connected SDR range");
+    connectedSdr = recoveredSdr;
+    connectedSdr.color.rangeAssumed = true;
+    ++connectedSdr.stride;
+    check(!source::retainConfiguredSdrColor(connectedSdr,configuredSdr),"different native layouts cannot borrow SDR metadata");
     ext.VideoTransferFunction=DXVA2_VideoTransFunc_Unknown;
     ext.NominalRange=DXVA2_NominalRange_48_208;vi.dwControlFlags=ext.value|AMCONTROL_COLORINFO_PRESENT;check(!source::captureMediaLayout(type,layout),"unsupported range fails closed");vi.dwControlFlags=0;
     vi.bmiHeader.biWidth=3;check(!source::captureMediaLayout(type,layout),"odd YUY2 width rejected");vi.bmiHeader.biWidth=4;

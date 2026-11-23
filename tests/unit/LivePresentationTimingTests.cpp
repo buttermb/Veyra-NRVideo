@@ -129,13 +129,48 @@ int main(){
         {
             // A freeze past the hitch window (picture 20 on samples 40-47) is
             // held on the grid from kHitchSlots after its keep, as a still screen.
-            CaptureHalfRate sampler;std::vector<int> repeats;uint64_t lastKept=~0ull;
-            for(int i=0;i<120;++i){
-                const uint64_t id=i<40?uint64_t(i/2):i<48?20:uint64_t(21+(i-48)/2);
-                if(sampler.accept(i*dt,dt,false,&id,uint64_t(i+1))){if(id==lastKept)repeats.push_back(i);lastKept=id;}
+            for(bool sequenced:{true,false}){
+                CaptureHalfRate sampler;std::vector<int> repeats,resumed;uint64_t lastKept=~0ull;
+                for(int i=0;i<120;++i){
+                    const uint64_t id=i<40?uint64_t(i/2):i<48?20:uint64_t(21+(i-48)/2);
+                    if(sampler.accept(i*dt,dt,false,&id,sequenced?uint64_t(i+1):0)){
+                        if(id==lastKept)repeats.push_back(i);
+                        if(i>=48&&i<54)resumed.push_back(i);
+                        lastKept=id;
+                    }
+                }
+                check(repeats==std::vector<int>{45,47}&&sampler.repeatsSkipped()==3&&sampler.repeatsHeld()==2,
+                      "a freeze longer than the hitch window is held on the grid");
+                check(resumed==std::vector<int>{48,50,52}&&sampler.earlyResumes()==1,
+                      "motion after a held copy starts on the first changed callback and keeps its original cadence");
             }
-            check(repeats==std::vector<int>{45,47}&&sampler.repeatsSkipped()==3&&sampler.repeatsHeld()==2,
-                  "a freeze longer than the hitch window is held on the grid");
+            CaptureHalfRate unknown;uint64_t same=1,changed=2;
+            for(unsigned i=0;i<=7;++i)unknown.accept(i*dt,dt,false,i==7?nullptr:&same,i+1);
+            check(!unknown.accept(8*dt,dt,false,&changed,9)&&unknown.earlyResumes()==0,
+                  "missing picture identity cannot prove a resume");
+        }
+    }
+    {
+        constexpr int64_t dt=166667;
+        for(bool sequenced:{false,true}){
+            for(int copies:{1,2,6,8,1200}){
+                CaptureHalfRate sampler;
+                int accepted=0;
+                for(int i=0;i<600;++i){
+                    const uint64_t id=uint64_t(i/copies);
+                    if(sampler.accept(i*dt,dt,false,&id,sequenced?i+1:0,true))++accepted;
+                }
+                check(accepted==300&&sampler.repeatsSkipped()==0,
+                      "fixed-rate capture supplies 30 inputs per second for motion, slow animation and stills");
+            }
+            CaptureHalfRate sampler;
+            std::vector<int> resumed;
+            for(int i=0;i<60;++i){
+                const uint64_t id=i<43?0:uint64_t(1+(i-43)/2);
+                if(sampler.accept(i*dt,dt,false,&id,sequenced?i+1:0,true)&&i>=43)resumed.push_back(i);
+            }
+            check(resumed==std::vector<int>{43,45,47,49,51,53,55,57,59}&&sampler.earlyResumes()==1,
+                  "fixed-rate capture takes the first change after a sustained still and keeps its cadence");
         }
     }
     check(!CaptureHalfRate::supported(30)&&!CaptureHalfRate::supported(18)&&!CaptureHalfRate::supported(120)&&CaptureHalfRate::supported(59.94),"60-to-30 setting does not halve other transport modes");
@@ -300,6 +335,42 @@ int main(){
     check(driverFlag.observe(true,true,true,true,.02,.09,120),"VRR does not hide source/arrival disagreement");
     check(veyra::source::captureClockBreak(1,.9,120),"VRR preserves backward-clock reset");
     check(veyra::engine::capturePairInterval100ns({83333,10000000},120,0,20,true)==83333,"reset does not reuse stale A/B interval");
+    check(veyra::engine::liveRefreshPacesPair(29.99,59.973,333333),"30 FPS capture matches a fixed 60 Hz refresh");
+    check(!veyra::engine::liveRefreshPacesPair(40,59.973,250000),"40 FPS capture keeps timestamp pacing on a 60 Hz display");
+    check(!veyra::engine::liveRefreshPacesPair(30,59.973,500000),"a delayed individual pair keeps timestamp pacing");
+    check(!veyra::engine::liveRefreshPacesPair(30,0,333333),"unknown refresh keeps timestamp pacing");
+    {
+        using veyra::engine::liveFastPairDisplay;
+        using veyra::engine::liveFastPairOriginalDue;
+        check(liveFastPairDisplay(60,144)&&liveFastPairDisplay(60,119.88),"a fast synchronized display has two flips per output interval");
+        check(!liveFastPairDisplay(60,100)&&!liveFastPairDisplay(60,59.94)&&!liveFastPairDisplay(60,0)&&
+              !liveFastPairDisplay(0,144)&&!liveFastPairDisplay(60,std::numeric_limits<double>::infinity()),"lower or unknown refresh keeps the original pacing");
+        constexpr int64_t cb=1000000, p=166667, submit=cb+65000;
+        check(liveFastPairOriginalDue(cb,submit,p,p)==submit+p,"a healthy generated pair keeps the 60 FPS output spacing");
+        check(liveFastPairOriginalDue(cb,submit,3*p,p)==submit+p,"a source hitch cannot stretch the hold after the intermediate");
+        check(liveFastPairOriginalDue(cb,submit,p/2,p)==submit+p/2,"a short true PTS span keeps its shorter hold");
+        check(liveFastPairOriginalDue(cb,submit,p,p,144)==submit+138889,
+              "the original can use the closer two-refresh midpoint at 144 Hz");
+        check(liveFastPairOriginalDue(cb,submit,p,p,120)==submit+p&&
+              liveFastPairOriginalDue(cb,submit,p/2,p,144)==submit+p/2,
+              "integer cadence and shorter input spans preserve their intended spacing");
+        for(double hz:{120.0,144.001,165.0,240.0}){
+            bool ordered=true;
+            const double tick=1e7/hz;
+            for(int i=0;i<600;++i){
+                const int64_t input=cb+i*2*p,gen=input+65000;
+                const auto original=liveFastPairOriginalDue(input,gen,p,p,hz);
+                const auto shown=[&](int64_t t){return std::ceil(t/tick);};
+                const double minGap=std::floor(p/tick+.001),maxGap=std::ceil(p/tick-.001);
+                for(double gap:{shown(original)-shown(gen),shown(gen+2*p)-shown(original)})
+                    ordered&=gap>=minGap&&gap<=maxGap;
+            }
+            check(ordered,"600 regular pairs keep supported refresh spacing and order on the fast panel");
+        }
+        check(liveFastPairOriginalDue(cb,cb+p+25000,p,p)==cb+2*p,"a late flip cannot push its original past the next nominal input");
+        check(liveFastPairOriginalDue(0,submit,p,p)==submit&&liveFastPairOriginalDue(cb,submit,p,0)==submit,
+              "unknown capture timing cannot delay an original");
+    }
     // Caller passes reset||skipped: a span across frames the player dropped is
     // not the source cadence (60 Hz capture, 100 ms gap -> keep 16.7 ms phase).
     check(veyra::engine::capturePairInterval100ns({166667,10000000},60,1000,1100,true)==166667,"skip gap does not stretch the presentation phase");
@@ -403,6 +474,13 @@ int main(){
         check(liveHalfRateCapacityWaitMs(2,16.68,16.67,16.68)==2,"60 Hz keeps the existing wait");
         check(liveHalfRateCapacityWaitMs(2,16.68,0,16.68)==2,"unknown refresh keeps the existing wait");
         check(liveHalfRateCapacityWaitMs(2,16.68,3.125,16.68)==3.125,"fast refresh waits at most one refresh");
+        using veyra::engine::liveMatchedPairCapacityWaitMs;
+        check(std::abs(liveMatchedPairCapacityWaitMs(16.67,6.0)-10.17)<.001,
+              "a matched synchronized pair may use a free slot and reserve the following refresh for its original");
+        check(liveMatchedPairCapacityWaitMs(16.67,16.4)==0&&liveMatchedPairCapacityWaitMs(16.67,30)==0,
+              "an already late generated frame cannot gain another wait at its original's expense");
+        check(liveMatchedPairCapacityWaitMs(0,4)==0&&liveMatchedPairCapacityWaitMs(16,-1)==0,
+              "unknown display or callback timing never extends display capacity waits");
         const auto measuredJitter=[&](double sdMs){
             LiveArrivalSmoother smoother;uint32_t seed=7;
             for(unsigned n=0;n<2000;++n)smoother.anchor(int64_t(n*333643.0*(1-800e-6)),int64_t(n*333643.0+40000+gaussian(seed,sdMs*10000)),interval);
