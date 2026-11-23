@@ -2,6 +2,8 @@
 
 # Veyra
 
+This community branch adds low-latency PS5 capture preview to Veyra 2.2.0. The setup guide includes the tested 60 FPS picture settings and latency measurements. [PS5 capture setup](docs/PS5_CAPTURE_60_FPS.md)
+
 <p align="center">
   <a href="https://x.com/likely2002">X · @likely2002</a> · <a href="https://www.youtube.com/@Likely7Ai">YouTube · @Likely7Ai</a><br>
   <a href="https://www.youtube.com/watch?v=ZJ42jzNAbik">English tutorial</a> · <a href="https://www.bilibili.com/video/BV1KvsE6bEPw/">中文教程</a>
