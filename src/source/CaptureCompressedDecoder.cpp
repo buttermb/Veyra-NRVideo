@@ -338,22 +338,26 @@ struct CaptureCompressedDecoder::Impl {
         error.clear();
     }
 
-    // Streams only: a GPU without this codec (for example AV1 before RTX 30)
-    // or a driver that rejects it fails before the first picture. Switch to
-    // software once; the caller asks the host for a key frame anyway.
-    void fallBackBeforeFirstPicture()
+    // A GPU/driver can accept the decoder object but reject the real stream
+    // before the first picture (unsupported codec, resolution, or surface
+    // extent). Switching to software is useful for capture cards as well as
+    // network streams; returning true lets the caller retry the same payload
+    // in the fresh decoder instead of losing the key frame that exposed the
+    // hardware failure.
+    bool fallBackBeforeFirstPicture()
     {
-        if (!stream || !hardware || frames != 0) return;
+        if (!hardware || frames != 0) return false;
         log::warn("capture-decode", std::format("codec={} hardware decode failed before the first picture; switching to the software decoder",
             captureCodecKey(codec)));
         decoder.close();
         hardware = false;
         if (!openSoftwareDecoder()) {
             error = "software fallback after a failed hardware decoder failed";
-            return;
+            return false;
         }
         decoder.recoverAtKeyframe();
         ++fallbacks;
+        return true;
     }
 
     bool openSoftwareDecoder()
@@ -407,11 +411,13 @@ struct CaptureCompressedDecoder::Impl {
         }
         const int* coefficients = sws_getCoefficients(swsColorspaceOf(frame.colorspace, unsigned(frame.height)));
         // MJPEG samples are full-range JPEG planes and the declared ingress
-        // contract for that path is full-range NV12. Compressed video keeps
-        // the bitstream's own range and lands on the standard limited target.
+        // contract for that path is full-range NV12. Other compressed video
+        // also keeps explicit full-range signaling: converting those code
+        // values into limited range would lose precision without making the
+        // downstream contract simpler. Unsignalled video remains limited.
         const bool jpegCoded = frame.format == AV_PIX_FMT_YUVJ420P || frame.format == AV_PIX_FMT_YUVJ422P || frame.format == AV_PIX_FMT_YUVJ444P;
         const int sourceFullRange = (codec == CaptureCodec::Mjpeg || frame.color_range == AVCOL_RANGE_JPEG || jpegCoded) ? 1 : 0;
-        const int targetFullRange = codec == CaptureCodec::Mjpeg ? 1 : 0;
+        const int targetFullRange = sourceFullRange;
         sws_setColorspaceDetails(sws, coefficients, sourceFullRange, coefficients, targetFullRange, 0, 1 << 16, 1 << 16);
         uint8_t* destination[4] = { target->data[0], target->data[1], nullptr, nullptr };
         const int destinationStride[4] = { target->linesize[0], target->linesize[1], 0, 0 };
@@ -570,7 +576,7 @@ bool CaptureCompressedDecoder::decodeOwned(const CompressedPayloadPtr& payload, 
             if (!sent) {
                 p.error = "decoder rejected the compressed payload";
                 ++p.failures;
-                p.fallBackBeforeFirstPicture();
+                if (p.fallBackBeforeFirstPicture()) continue;
                 return false;
             }
         }
@@ -588,7 +594,7 @@ bool CaptureCompressedDecoder::decodeOwned(const CompressedPayloadPtr& payload, 
             if (p.decoder.receiveStatus() == media::DecodeReceiveStatus::Error) {
                 p.error = "decoder receive failed";
                 ++p.failures;
-                p.fallBackBeforeFirstPicture();
+                if (p.fallBackBeforeFirstPicture() && !receiveOnly) continue;
             } else {
                 p.error.clear();
                 p.waiting = true;

@@ -2704,23 +2704,32 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
                 }
                 if(isScreen){std::lock_guard lock(mutex_);snapshot_.sourceNotice=screenSource.status();}
                 const bool nativeCapture=physicalCapture&&activeSource->info().videoDecodePath=="decklink";
-                if((isStream||isScreen||nativeCapture)&&frame&&(uint32_t(frame->width)!=width||uint32_t(frame->height)!=height||(isScreen&&gd.hdrInput!=activeSource->info().color.isHdrPath())||
-                    (nativeCapture&&!source::decklink::sameColor(captureGraphColor,activeSource->info().color)))){
+                const bool compressedCapture=physicalCapture&&captureSource.compressedVideo();
+                // Compressed capture reveals the actual bit depth and HDR signaling after decode.
+                const auto frameSourceColor=compressedCapture?pkt.colorInfo:activeSource->info().color;
+                const bool compressedFormatChange=compressedCapture&&frame&&
+                    (ingressBitDepth(frameSourceColor.pixelFormat)!=gd.captureBitDepth||frameSourceColor.isHdrPath()!=gd.hdrInput);
+                const bool streamContractChange=(isStream||isScreen||nativeCapture)&&frame&&
+                    (uint32_t(frame->width)!=width||uint32_t(frame->height)!=height||(isScreen&&gd.hdrInput!=frameSourceColor.isHdrPath())||
+                     (nativeCapture&&!source::decklink::sameColor(captureGraphColor,frameSourceColor)));
+                if(streamContractChange||compressedFormatChange){
+                    if(compressedFormatChange)log::info("capture-format-change",std::format("pixelFormat={} bitDepth={} hdr={} previousBitDepth={} previousHdr={}; rebuilding compressed ingress",
+                        int(frameSourceColor.pixelFormat),ingressBitDepth(frameSourceColor.pixelFormat),frameSourceColor.isHdrPath(),gd.captureBitDepth,gd.hdrInput));
                     drainLivePresentation();if(!ring.drainQueue()){status(L"串流尺寸切换排空失败",true);break;}
                     width=uint32_t(frame->width);height=uint32_t(frame->height);
                     describeStages(stageRequest(options),options.snapshot(),gd);
-                    gd.hdrInput=!isImage&&activeSource->info().color.isHdrPath();gd.hdrOutput=options.settings.useHdrPreview(gd.hdrInput,displayHdrActive());
-                    const auto resizeSourceColor=activeSource->info().color;
+                    gd.hdrInput=!isImage&&frameSourceColor.isHdrPath();gd.hdrOutput=options.settings.useHdrPreview(gd.hdrInput,displayHdrActive());
+                    const auto& resizeSourceColor=frameSourceColor;
                     const unsigned resizeMastering=hdrMetadataNits(resizeSourceColor.hdrMasteringPeakNits);
                     const unsigned resizeCll=hdrMetadataNits(resizeSourceColor.hdrMaxCllNits);
                     const unsigned resizeFall=hdrMetadataNits(resizeSourceColor.hdrMaxFallNits);
-                    if(nativeCapture){
-                        captureGraphColor=activeSource->info().color;gd.rgbInput=captureGraphColor.pixelFormat==pipeline::SourcePixelFormat::Bgra8;
+                    if(nativeCapture||compressedCapture){
+                        captureGraphColor=frameSourceColor;gd.rgbInput=captureGraphColor.pixelFormat==pipeline::SourcePixelFormat::Bgra8;
                         gd.yuy2Input=false;gd.packedInput=pipeline::packedInputCode(captureGraphColor.pixelFormat);gd.captureBitDepth=ingressBitDepth(captureGraphColor.pixelFormat);
                     }
                     // Window capture publishes the same geometry used to rebuild
                     // the graph, rather than retaining its opening DAR.
-                    if(isScreen||nativeCapture){
+                    if(isScreen||nativeCapture||compressedCapture){
                         std::lock_guard lock(mutex_);snapshot_.sourceWidth=width;snapshot_.sourceHeight=height;snapshot_.sourceHdr=gd.hdrInput;snapshot_.sourceMasteringPeakNits=resizeMastering;snapshot_.sourceMaxCllNits=resizeCll;snapshot_.sourceMaxFallNits=resizeFall;snapshot_.sourceDisplayAspect=activeSource->info().displayAspect;
                     }
                     if(!presenter->prepareGraphChange()){status(L"输入尺寸切换呈现排空失败",true);break;}

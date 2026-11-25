@@ -57,10 +57,9 @@ public:
     // then uses the native decoder with D3D12VA (the libdav1d decoder FFmpeg
     // would pick has no hardware path), HEVC decodes through D3D11VA on its own
     // device (HEVC D3D12VA fails at 4K and can remove the shared device on
-    // NVIDIA drivers, see FFmpegVideoDecoder::openD3D11VA), a hardware decoder
-    // that fails before its first picture is replaced by the software one, and
-    // the software decoder runs several low-delay threads. Capture cards keep
-    // the original behaviour.
+    // NVIDIA drivers, see FFmpegVideoDecoder::openD3D11VA), and the software
+    // decoder runs several low-delay threads. Both capture and stream decoders
+    // retry the same payload in software if hardware fails before the first picture.
     void setStreamProfile(bool enabled);
     // Xbox targets begin with an estimate. In this mode the decoder can resize
     // an owned CPU target to the actual coded dimensions after the first frame.

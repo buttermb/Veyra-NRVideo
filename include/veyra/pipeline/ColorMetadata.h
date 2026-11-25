@@ -5,6 +5,7 @@ extern "C" {
 #include <libavutil/pixfmt.h>
 #include <libavutil/pixdesc.h>
 #include <libavutil/mastering_display_metadata.h>
+#include <libavutil/hwcontext.h>
 }
 namespace veyra::pipeline {
 inline ColorDescription resolveFrameColor(const AVFrame& frame,ColorDescription c={}){
@@ -26,6 +27,17 @@ inline ColorDescription resolveFrameColor(const AVFrame& frame,ColorDescription 
     default:break;
     }
     switch(frame.format){
+    case AV_PIX_FMT_D3D11:case AV_PIX_FMT_D3D12:
+        // Hardware frames carry their real storage format in the hardware
+        // frames context. HEVC/AV1 10-bit decode is P010 even though the
+        // outer frame format is the API tag; treating it as NV12 would make a
+        // compressed HDR capture configure an 8-bit ingress path.
+        if(frame.hw_frames_ctx){
+            const auto* context=reinterpret_cast<const AVHWFramesContext*>(frame.hw_frames_ctx->data);
+            if(context->sw_format==AV_PIX_FMT_NV12)c.pixelFormat=SourcePixelFormat::NV12;
+            else if(context->sw_format==AV_PIX_FMT_P010)c.pixelFormat=SourcePixelFormat::P010;
+        }
+        break;
     case AV_PIX_FMT_NV12:c.pixelFormat=SourcePixelFormat::NV12;break;
     case AV_PIX_FMT_P016:c.pixelFormat=SourcePixelFormat::P016;break;
     case AV_PIX_FMT_YUV420P10LE:case AV_PIX_FMT_P010:c.pixelFormat=SourcePixelFormat::P010;break;

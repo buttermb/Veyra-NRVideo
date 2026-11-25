@@ -9,6 +9,7 @@
 #include "veyra/gfx/D3D12DeviceContext.h"
 #include "veyra/media/FFmpegVideoDecoder.h"
 #include "veyra/pipeline/CaptureUploadFrame.h"
+#include "veyra/pipeline/ColorMetadata.h"
 
 #include <iostream>
 #include <filesystem>
@@ -406,10 +407,28 @@ bool sameP010Pixels(const AVFrame& reference, const AVFrame& output)
     return true;
 }
 
+bool sameSideData(const AVFrame& reference, const AVFrame& output, AVFrameSideDataType type)
+{
+    const auto* expected = av_frame_get_side_data(&reference, type);
+    const auto* actual = av_frame_get_side_data(&output, type);
+    if (!expected) return true; // the generated fixture controls what must exist
+    return actual && actual->size == expected->size && std::memcmp(actual->data, expected->data, expected->size) == 0;
+}
+
+bool sameColorContract(const AVFrame& reference, const AVFrame& output)
+{
+    return reference.colorspace == output.colorspace &&
+        reference.color_primaries == output.color_primaries &&
+        reference.color_trc == output.color_trc &&
+        reference.chroma_location == output.chroma_location &&
+        sameSideData(reference, output, AV_FRAME_DATA_MASTERING_DISPLAY_METADATA) &&
+        sameSideData(reference, output, AV_FRAME_DATA_CONTENT_LIGHT_LEVEL);
+}
+
 // 10-bit compressed input must not be quantized to 8-bit merely because the
 // preallocated capture target is NV12. The first picture allocates a P010
 // output; that output is then supplied back to the decoder and must be reused.
-bool tenBitSoftwareOutputTest(const ElementaryStream& stream)
+bool tenBitSoftwareOutputTest(const ElementaryStream& stream, bool nativeResize = false)
 {
     if (stream.codec != source::CaptureCodec::Hevc) return false;
     AVCodecParameters* parameters = avcodec_parameters_alloc();
@@ -444,12 +463,16 @@ bool tenBitSoftwareOutputTest(const ElementaryStream& stream)
     if (!ok || referenceFrames.empty()) return false;
 
     source::CaptureCompressedDecoder decoder;
-    if (!decoder.open(stream.codec, unsigned(stream.width), unsigned(stream.height), nullptr, 0, nullptr, nullptr)) return false;
+    const int suppliedWidth = nativeResize ? std::max(2, stream.width / 4 * 2) : stream.width;
+    const int suppliedHeight = nativeResize ? std::max(2, stream.height / 4 * 2) : stream.height;
+    decoder.setStreamProfile(nativeResize);
+    decoder.preserveSoftwareStreamExtent(nativeResize);
+    if (!decoder.open(stream.codec, unsigned(suppliedWidth), unsigned(suppliedHeight), nullptr, 0, nullptr, nullptr)) return false;
     AVFrame* supplied = av_frame_alloc();
     if (!supplied) return false;
     supplied->format = AV_PIX_FMT_NV12;
-    supplied->width = stream.width;
-    supplied->height = stream.height;
+    supplied->width = suppliedWidth;
+    supplied->height = suppliedHeight;
     ok = av_frame_get_buffer(supplied, 32) >= 0;
     AVFrame* target = supplied;
     TestFramePtr adopted;
@@ -477,7 +500,8 @@ bool tenBitSoftwareOutputTest(const ElementaryStream& stream)
             ok = out == target;
         }
         const auto expected = referenceFrames.find(out->pts);
-        ok = ok && expected != referenceFrames.end() && sameP010Pixels(*expected->second, *out);
+        ok = ok && expected != referenceFrames.end() && sameP010Pixels(*expected->second, *out) &&
+            sameColorContract(*expected->second, *out);
         if (ok) ++compared;
         if (out != target && out != adopted.get()) av_frame_free(&out);
     }
@@ -485,6 +509,78 @@ bool tenBitSoftwareOutputTest(const ElementaryStream& stream)
     std::cout << (ok ? "PASS " : "FAIL ") << "10-bit HEVC software fallback preserves exact P010 pixels frames="
         << produced << " compared=" << compared << '\n';
     if (supplied) av_frame_free(&supplied);
+    return ok;
+}
+
+// Hardware compressed capture must advertise the real surface storage too:
+// AV_PIX_FMT_D3D12 is only the transport tag, while the hardware frames
+// context says whether the decoder produced NV12 or P010.
+bool tenBitHardwareDecodeTest(const ElementaryStream& stream, gfx::D3D12DeviceContext& device)
+{
+    if (stream.codec != source::CaptureCodec::Hevc) return false;
+    source::CaptureCompressedDecoder decoder;
+    if (!decoder.open(stream.codec, unsigned(stream.width), unsigned(stream.height), nullptr, 0,
+        device.device(), device.directQueue())) return false;
+    AVFrame* target = av_frame_alloc();
+    if (!target) return false;
+    target->format = AV_PIX_FMT_NV12;
+    target->width = stream.width;
+    target->height = stream.height;
+    bool ok = av_frame_get_buffer(target, 32) >= 0;
+    bool produced = false;
+    for (size_t i = 0; ok && i < stream.accessUnits.size() && !produced; ++i) {
+        AVFrame* out = nullptr;
+        bool hardware = false;
+        const auto& unit = stream.accessUnits[i];
+        if (!decoder.decode(unit.data(), unit.size(), stream.pts[i], target, &out, hardware)) {
+            ok = decoder.waitingForInput();
+            continue;
+        }
+        produced = true;
+        bool wideHardware = false;
+        if (hardware && out && out->format == AV_PIX_FMT_D3D12 && out->hw_frames_ctx) {
+            const auto* frames = reinterpret_cast<const AVHWFramesContext*>(out->hw_frames_ctx->data);
+            wideHardware = frames->sw_format == AV_PIX_FMT_P010;
+        }
+        pipeline::ColorDescription fallback;
+        fallback.pixelFormat = pipeline::SourcePixelFormat::NV12;
+        const auto resolved = pipeline::resolveFrameColor(*out, fallback);
+        ok = hardware && wideHardware && resolved.pixelFormat == pipeline::SourcePixelFormat::P010;
+    }
+    std::cout << (ok ? "PASS " : "FAIL ") << "10-bit HEVC hardware decode exposes P010 through D3D12 metadata\n";
+    av_frame_free(&target);
+    return ok && produced;
+}
+
+// FFmpeg/D3D12 rejects some small coded extents after the decoder object was
+// opened successfully. The capture decoder must not stay on that dead hardware
+// path: it should replace it with software before the first picture and still
+// emit the deep-bitstream frame as P010.
+bool unsupportedHardwareExtentFallbackTest(const ElementaryStream& stream, gfx::D3D12DeviceContext& device)
+{
+    if (stream.codec != source::CaptureCodec::Hevc) return false;
+    source::CaptureCompressedDecoder decoder;
+    if (!decoder.open(stream.codec, unsigned(stream.width), unsigned(stream.height), nullptr, 0,
+        device.device(), device.directQueue())) return false;
+    bool ok = true, produced = false, softwareP010 = false;
+    for (size_t i = 0; i < stream.accessUnits.size() && !produced; ++i) {
+        AVFrame* out = nullptr;
+        bool hardware = false;
+        const auto& unit = stream.accessUnits[i];
+        if (!decoder.decode(unit.data(), unit.size(), stream.pts[i], nullptr, &out, hardware)) {
+            if (!decoder.waitingForInput() && decoder.hardwareFallbacks() == 0) {
+                ok = false;
+                break;
+            }
+            continue;
+        }
+        produced = true;
+        softwareP010 = !hardware && out && out->format == AV_PIX_FMT_P010;
+        if (out && !hardware) av_frame_free(&out);
+    }
+    ok = ok && produced && softwareP010 && decoder.hardwareFallbacks() > 0;
+    std::cout << (ok ? "PASS " : "FAIL ") << "unsupported small D3D12 extent falls back before the first picture fallbacks="
+        << decoder.hardwareFallbacks() << " softwareP010=" << softwareP010 << "\n";
     return ok;
 }
 
@@ -586,8 +682,20 @@ int wmain(int argc, wchar_t** argv)
         ElementaryStream tenBit;std::string tenBitError;
         const auto utf8TenBit=std::filesystem::path(argv[2]).u8string();
         const std::string tenBitStorage(utf8TenBit.begin(),utf8TenBit.end());
-        check(loadAnnexB(tenBitStorage.c_str(),tenBit,tenBitError)&&tenBitSoftwareOutputTest(tenBit),
+        const bool loadedTenBit=loadAnnexB(tenBitStorage.c_str(),tenBit,tenBitError);
+        check(loadedTenBit&&tenBitSoftwareOutputTest(tenBit),
             "10-bit HEVC compressed input preserves P010 in the software fallback");
+        check(loadedTenBit&&tenBitSoftwareOutputTest(tenBit,true),
+            "native stream resize preserves the full P010 picture and reuses its replacement target");
+        check(loadedTenBit&&tenBitHardwareDecodeTest(tenBit,context),
+            "10-bit HEVC compressed input exposes P010 in the hardware backend");
+    }
+    if(argc>3){
+        ElementaryStream small;std::string smallError;
+        const auto utf8Small=std::filesystem::path(argv[3]).u8string();
+        const std::string smallStorage(utf8Small.begin(),utf8Small.end());
+        check(loadAnnexB(smallStorage.c_str(),small,smallError)&&unsupportedHardwareExtentFallbackTest(small,context),
+            "unsupported hardware extent falls back to software without losing deep input");
     }
     // B-frame reordering may emit a slightly different count on the software
     // path; the hardware and software backends must stay within one frame.
