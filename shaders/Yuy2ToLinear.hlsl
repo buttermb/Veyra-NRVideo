@@ -24,7 +24,7 @@ float2 pairChroma(uint pairX, uint y) { return packedYuy2[uint2(pairX, y)].yw; }
 // positions linearly; unknown siting uses the MPEG/HD-video left convention.
 float2 reconstructChroma422(uint x, uint y)
 {
-    const uint mode=uint(chromaModeBits);
+    const uint mode=asuint(chromaModeBits);
     const uint pairX=x/2;
     if(mode==0)return pairChroma(pairX,y);
     const float horizontalOrigin=(mode==2||mode==4||mode==6)?0.5:0.0;

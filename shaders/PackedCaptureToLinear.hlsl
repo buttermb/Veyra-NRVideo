@@ -40,7 +40,7 @@ float2 packedChromaAt(uint pairX, uint y) {
 // repeating one sample across both luma pixels. Unknown siting follows MPEG
 // left placement; center siting is JPEG-style placement.
 float2 reconstructChroma422(uint x, uint y) {
-    const uint mode = uint(chromaModeBits);
+    const uint mode = asuint(chromaModeBits);
     const uint pairX = x / 2;
     if (mode == 0) return packedChromaAt(pairX, y);
     const float horizontalOrigin = (mode == 2 || mode == 4 || mode == 6) ? 0.5 : 0.0;
@@ -81,7 +81,7 @@ float2 v210ChromaCached(uint pairX, uint y, int groupPairBase, uint4 words) {
 // current pixel's group words are reused, so interior pixels add no texture
 // fetches for chroma reconstruction; only group-boundary taps read a neighbor.
 float2 reconstructChromaV210(uint x, uint y, uint4 words) {
-    const uint mode=uint(chromaModeBits);
+    const uint mode=asuint(chromaModeBits);
     const uint pairX=x/2;
     const int groupPairBase=int(x/6)*3;
     if(mode==0)return v210ChromaFromWords(words,pairX-uint(groupPairBase));

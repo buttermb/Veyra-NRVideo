@@ -370,6 +370,7 @@ int wmain(int argc,wchar_t**argv){
         if(remoteYuv){color.pixelFormat=pipeline::SourcePixelFormat::Yuv420P;color.transfer=pipeline::TransferFunction::BT709;color.preserveSdrCodeValues=!legacyRemote;color.displayReferred709=legacyRemote;}
         pipeline::EnhanceGraph::FrameOutputs out;sink::RgbaImage image,display;
         if(rgb)color.pixelFormat=pipeline::SourcePixelFormat::Bgra8;
+        if(!remoteYuv&&!rgb)pipeline::enableCaptureChromaReconstruction(color);
         const double ptsMs=frameId*100.0;++frameId;
         bool ok=graph.process(f,ptsMs,!temporal||index==0,out,frameId,&color)&&sink::readRgba8(ctx,ring,graph.videoFrameResource(out.videoSlot),image);
         int error=0,displayError=0;uint64_t sum=0;
