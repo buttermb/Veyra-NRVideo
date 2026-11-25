@@ -928,6 +928,23 @@ int denoiseQualityCase(bool hdr) {
                 for(unsigned x=rx-6;x<=rx+6;++x)
                     if(isReticle(x,y))std::memset(f->data[0]+size_t(y)*f->linesize[0]+x*4,245,3);
     }
+    if(!hdr){
+        // A noise-free two-pixel luma texture directly measures collateral
+        // detail loss; the noise injection below intentionally stops at y1.
+        for(auto* f:{clean,noisy})
+            for(unsigned y=100;y<140;++y)
+                for(unsigned x=x0;x<x1;++x){
+                    auto* pixel=f->data[0]+size_t(y)*f->linesize[0]+size_t(x)*4;
+                    const int texture=((x/2+y/2)&1)?8:-8;
+                    if(x<84)for(unsigned k=0;k<3;++k)pixel[k]=uint8_t(std::clamp(int(pixel[k])+texture,0,255));
+                    else{
+                        // Blue +12 / red -4 has almost zero BT.709 luma, so this
+                        // half isolates chroma detail rather than brightness detail.
+                        pixel[0]=uint8_t(std::clamp(int(pixel[0])+texture*3/2,0,255));
+                        pixel[2]=uint8_t(std::clamp(int(pixel[2])-texture/2,0,255));
+                    }
+                }
+    }
     uint32_t rng=0x51c0ffee;
     auto noise=[&](int amount) {
         rng^=rng<<13;rng^=rng>>17;rng^=rng<<5;
@@ -994,8 +1011,27 @@ int denoiseQualityCase(bool hdr) {
                     }
             check(edgeMax<=1,"video denoise: one-pixel crosshair is preserved");
         }
-        std::printf("DENOISE_QUALITY format=%s noiseRmsRatio=%.4f edgeMax=%.3f\n",
-                    hdr?"P010/PQ":"BGR0/SDR",ratio,edgeMax);
+        double lineError=0,lineMax=0;size_t lineCount=0;
+        for(unsigned y=0;y<scene.height;++y)
+            for(unsigned x=0;x<scene.width;++x)
+                if(scene.line(x+0.5,y+0.5))for(unsigned k=0;k<3;++k){
+                    const auto i=size_t(y)*scene.width+x;
+                    const double error=std::abs(value(on,i,k)-value(off,i,k));
+                    lineError+=error;lineMax=std::max(lineMax,error);++lineCount;
+                }
+        lineError/=lineCount?lineCount:1;
+        double textureError=0,textureMax=0,chromaError=0,chromaMax=0;size_t textureCount=0,chromaCount=0;
+        if(!hdr)for(unsigned y=100;y<140;++y)
+            for(unsigned x=x0;x<x1;++x)
+                for(unsigned k=0;k<3;++k){
+                    const auto i=size_t(y)*scene.width+x;
+                    const double error=std::abs(value(on,i,k)-value(reference,i,k));
+                    if(x<84){textureError+=error;textureMax=std::max(textureMax,error);++textureCount;}
+                    else{chromaError+=error;chromaMax=std::max(chromaMax,error);++chromaCount;}
+                }
+        textureError/=textureCount?textureCount:1;chromaError/=chromaCount?chromaCount:1;
+        std::printf("DENOISE_QUALITY format=%s noiseRmsRatio=%.4f edgeMax=%.3f lineMean=%.4f lineMax=%.4f textureMean=%.4f textureMax=%.4f chromaMean=%.4f chromaMax=%.4f\n",
+                    hdr?"P010/PQ":"BGR0/SDR",ratio,edgeMax,lineError,lineMax,textureError,textureMax,chromaError,chromaMax);
         check(ratio<.90,"video denoise: RMS noise in the dark patch drops by at least 10%");
         settings.videoDenoise={0,0};
         check(gpu->graph->applySettings(settings)&&gpu->render(noisy,false,zero)&&zero.pixels==off.pixels,

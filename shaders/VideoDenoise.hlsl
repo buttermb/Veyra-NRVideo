@@ -49,11 +49,12 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID, uint thread 
     const float lumaScale = rcp(hdr ? 0.003 + 0.018 * light : 0.006 + 0.030 * light);
     const float chromaScale = rcp(hdr ? 0.007 + 0.038 * light : 0.015 + 0.044 * light);
     float3 sum = 0.0;
-    float weights = 0.0;
+    float weights = 1.0; // centre tap weight; its zero delta is skipped below
     [unroll]
     for (uint y = 0; y < 5; ++y) {
         [unroll]
         for (uint x = 0; x < 5; ++x) {
+            if (x == Radius && y == Radius) continue;
             const float4 delta = pixels[local.y + y][local.x + x] - center;
             const float dy = delta.w * lumaScale;
             const float3 dc = (delta.rgb - delta.w) * chromaScale;
@@ -62,7 +63,7 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID, uint thread 
             weights += w;
         }
     }
-    const float3 change = sum / weights; // centre weight is 1
+    const float3 change = sum / weights;
     const float y = dot(change, Luma709);
     Output[at] = float4(source.rgb + chromaStrength * (change - y) + lumaStrength * y, source.a);
 }
