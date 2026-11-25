@@ -35,6 +35,7 @@ cbuffer YuvParams : register(b0)
 Texture2D<float> lumaPlane : register(t0);   // R8_UNORM or R16_UNORM
 Texture2D<float2> chromaPlane : register(t1); // R8G8_UNORM or R16G16_UNORM
 Texture2D<float2> chromaPlane2 : register(t2); // second chroma view (unused for NV12; reserved)
+SamplerState chromaLinearClamp : register(s1);
 // Custom (P7): enhancement layer planes, integer samples, 4:2:0 10-bit:
 // luma at full size, chroma at half size per axis.
 Texture2D<uint> elLumaPlane : register(t12);
@@ -165,13 +166,25 @@ float2 ReconstructChroma(uint2 pixel, float y, bool guide, out float2 detail)
     if(location==0)return chromaPlane[pixel/2];
     // Chroma sample origin in luma pixel-center coordinates. Respect MPEG
     // left, JPEG center and vertical top/bottom placement; no luma filtering.
+    // Hardware bilinear sampling evaluates the same four-tap filter the
+    // manual loads below used to spell out, while the texture unit performs
+    // the tap selection and edge clamping. This keeps reconstruction affordable
+    // enough to use on live capture.
     float2 origin=float2(0.0,0.5);
     if(location==2)origin=float2(0.5,0.5);
     else if(location==3)origin=float2(0.0,0.0);
     else if(location==4)origin=float2(0.5,0.0);
     else if(location==5)origin=float2(0.0,1.0);
     else if(location==6)origin=float2(0.5,1.0);
-    float2 position=(float2(pixel)-origin)*0.5;
+    const float2 position=(float2(pixel)-origin)*0.5;
+    if (!guide || location != 6u) {
+        // The GPU view may include decoder padding beyond the visible picture.
+        uint texWidth, texHeight;
+        chromaPlane.GetDimensions(texWidth, texHeight);
+        const float2 lastVisible = float2((yuvDimensions.xy + 1u) / 2u) - 1.0;
+        const float2 uv = (clamp(position, 0.0, lastVisible) + 0.5) / float2(texWidth, texHeight);
+        return chromaPlane.SampleLevel(chromaLinearClamp, uv, 0);
+    }
     int2 base=int2(floor(position));float2 fraction=frac(position);
     // Clamp to the visible chroma extent, not decoder allocation padding.
     int2 last=int2((yuvDimensions.xy+1)/2)-1;

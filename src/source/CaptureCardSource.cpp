@@ -609,7 +609,7 @@ struct CaptureCardSource::Impl:ISampleGrabberCB {
     // Decode worker: keeps the DirectShow callback cheap (payload copy only)
     // and lets the decode overlap with graph work. The worker owns workerFrame
     // and swaps it into the mailbox once a frame is ready.
-    struct CompressedSample{std::vector<uint8_t> payload;double time=0;Clock::time_point arrival;REFERENCE_TIME start=0,end=0;bool completeTime=false,bad=false,reset=false;uint64_t order=0;};
+    struct CompressedSample{CompressedPayloadPtr payload;double time=0;Clock::time_point arrival;REFERENCE_TIME start=0,end=0;bool completeTime=false,bad=false,reset=false;uint64_t order=0;};
     std::deque<CompressedSample> compressedQueue;size_t compressedQueueLimit=3;
     // MJPEG is intra-only, so several decoders work on consecutive payloads at
     // once (mjpegLoop). One software decoder manages about 110 fps at 1440p;
@@ -620,16 +620,42 @@ struct CaptureCardSource::Impl:ISampleGrabberCB {
     // Recycled payload buffers: the callback used to allocate a fresh vector
     // per sample under the mailbox lock (MJPEG 4K = several MB); the worker
     // returns the buffer after decode (sweep 2026-09-22 C4).
-    std::vector<std::vector<uint8_t>> payloadPool;
-    std::vector<uint8_t> takePayload(){if(payloadPool.empty())return {};auto v=std::move(payloadPool.back());payloadPool.pop_back();v.clear();return v;}
-    void returnPayload(std::vector<uint8_t>&& v){if(payloadPool.size()<8){v.clear();payloadPool.push_back(std::move(v));}}
+    std::vector<CompressedPayloadPtr> payloadPool;
+    CompressedPayloadPtr takePayload(){
+        if(payloadPool.empty())return std::make_shared<CompressedPayload>();
+        auto v=std::move(payloadPool.back());payloadPool.pop_back();v->size=0;return v;
+    }
+    // FFmpeg may still reference a compressed packet while hardware/software
+    // decode finishes asynchronously. Recycle only when this worker is the
+    // sole owner; otherwise the AVBuffer release callback will destroy it.
+    void returnPayload(CompressedPayloadPtr v){
+        if(v&&v.use_count()==1&&payloadPool.size()<8){v->size=0;payloadPool.push_back(std::move(v));}
+    }
     std::thread decodeThread;std::condition_variable decodeWake;bool decodeStop=false;
     AVFrame* workerFrame=nullptr;uint64_t compressedDropped=0;double lastCallbackTime=0;
-    // NV12 frames the decode worker may write into. A frame enters this pool
-    // only when it was never delivered, or when a read() call released it
+    // NV12/P010 frames the decode worker may write into. A frame enters this
+    // pool only when it was never delivered, or when a read() call released it
     // (the caller's ownership ends at the next read), so a frame the caller
     // still holds is never overwritten underneath it.
     std::vector<AVFrame*> compressedFree;
+    // Pool selection is format-aware because the compressed bit depth is known
+    // only after FFmpeg decodes the first picture. Until then the initial NV12
+    // targets are a fallback; once P010 frames exist, they are preferred for a
+    // 10-bit stream instead of allocating another target or quantizing to 8 bit.
+    AVFrame* takeCompressedTargetLocked(){
+        if(compressedFree.empty())return nullptr;
+        const auto hint=AVPixelFormat(compressedDecoder.softwareTargetFormat());
+        if(hint!=AV_PIX_FMT_NONE){
+            for(size_t i=compressedFree.size();i-- >0;){
+                if(compressedFree[i]&&compressedFree[i]->format==int(hint)){
+                    AVFrame* frame=compressedFree[i];
+                    compressedFree.erase(compressedFree.begin()+ptrdiff_t(i));
+                    return frame;
+                }
+            }
+        }
+        AVFrame* frame=compressedFree.back();compressedFree.pop_back();return frame;
+    }
     // Manual capture flip; read by the DirectShow callback thread.
     std::atomic<bool> verticalFlip{false};
     // Content dedup wants picture numbers; the reference lives on the callback thread.
@@ -764,18 +790,22 @@ struct CaptureCardSource::Impl:ISampleGrabberCB {
             // Upload-backed target: written once, straight into GPU upload memory.
             pipeline::selectCaptureUploadTarget(*target);
             AVFrame* decodedFrame=nullptr;bool hardware=false;
-            const bool produced=decoder.decode(sample.payload.data(),sample.payload.size(),int64_t(sample.time*1e7),target,&decodedFrame,hardware)&&!hardware;
+            const bool produced=decoder.decodeOwned(sample.payload,int64_t(sample.time*1e7),target,&decodedFrame,hardware)&&!hardware;
             {
                 std::lock_guard lock(mutex);
-                if(sample.payload.capacity())returnPayload(std::move(sample.payload));
+                returnPayload(std::move(sample.payload));
                 if(!produced){++compressedErrors;compressedFree.push_back(target);continue;}
                 if(sample.order<=lastPublishedOrder){
                     // A newer picture is already in the mailbox.
-                    ++reorderDrops;++compressedDropped;++dropped;compressedFree.push_back(target);continue;
+                    ++reorderDrops;++compressedDropped;++dropped;
+                    compressedFree.push_back(decodedFrame);
+                    if(decodedFrame!=target)compressedFree.push_back(target);
+                    continue;
                 }
                 lastPublishedOrder=sample.order;
                 if(pendingFrame){compressedFree.push_back(pendingFrame);if(pending)++dropped;}
-                pendingFrame=target;pendingIsHardware=false;
+                if(decodedFrame!=target)compressedFree.push_back(target);
+                pendingFrame=decodedFrame;pendingIsHardware=false;
                 pendingDiscontinuity=(pending&&pendingDiscontinuity)||sample.bad;
                 pending=true;pendingTime=sample.time;pendingArrival=sample.arrival;
                 pendingDuration=captureDuration(sample.start,sample.end,sample.completeTime,nominalDuration100ns);
@@ -803,15 +833,19 @@ struct CaptureCardSource::Impl:ISampleGrabberCB {
                 if(!draining){sample=std::move(compressedQueue.front());compressedQueue.pop_front();}
                 target=workerFrame;workerFrame=nullptr;
             }
+            // Upload-backed target when available: the software repack writes
+            // once into GPU upload memory; swscale explicitly falls back to the
+            // frame's CPU planes because it cannot provide the analysis proxy.
+            pipeline::selectCaptureUploadTarget(*target);
             AVFrame* decodedFrame=nullptr;bool hardware=false;
             if(sample.reset){compressedDecoder.recoverAtKeyframe();metadata.clear();recoveryBoundary=true;}
             CompressedSample stamp;
             stamp.time=sample.time;stamp.arrival=sample.arrival;stamp.start=sample.start;stamp.end=sample.end;
             stamp.completeTime=sample.completeTime;stamp.bad=sample.bad;
             if(!draining){metadata.push_back(stamp);if(metadata.size()>64)metadata.pop_front();}
-            const bool produced=compressedDecoder.decode(draining?nullptr:sample.payload.data(),draining?0:sample.payload.size(),
+            const bool produced=compressedDecoder.decodeOwned(draining?CompressedPayloadPtr{}:sample.payload,
                 int64_t(sample.time*1e7),target,&decodedFrame,hardware);
-            if(!draining&&sample.payload.capacity()){std::lock_guard lock(mutex);returnPayload(std::move(sample.payload));}
+            if(!draining){std::lock_guard lock(mutex);returnPayload(std::move(sample.payload));}
             if(!produced){
                 draining=false;
                 // A decoder that needs more input before it can emit a frame is
@@ -826,14 +860,18 @@ struct CaptureCardSource::Impl:ISampleGrabberCB {
             if(decodedPts==AV_NOPTS_VALUE){
                 log::warn("capture-decode","discarding decoded frame without a presentation timestamp");
                 recoveryBoundary=true;
-                std::lock_guard lock(mutex);workerFrame=target;++compressedErrors;++dropped;continue;
+                std::lock_guard lock(mutex);
+                if(decodedFrame!=target)compressedFree.push_back(decodedFrame);
+                workerFrame=target;++compressedErrors;++dropped;continue;
             }
             const auto match=std::find_if(metadata.begin(),metadata.end(),[&](const auto& item){return int64_t(item.time*1e7)==decodedPts;});
             if(match!=metadata.end()){stamp=*match;metadata.erase(match);}
             else{
                 log::warn("capture-decode","discarding decoded frame without matching input metadata");
                 recoveryBoundary=true;
-                std::lock_guard lock(mutex);workerFrame=target;++compressedErrors;++dropped;continue;
+                std::lock_guard lock(mutex);
+                if(decodedFrame!=target)compressedFree.push_back(decodedFrame);
+                workerFrame=target;++compressedErrors;++dropped;continue;
             }
             {
                 std::lock_guard lock(mutex);
@@ -849,8 +887,12 @@ struct CaptureCardSource::Impl:ISampleGrabberCB {
                     // a replaced pending frame goes back to the pool instead of
                     // being reused directly.
                     if(pending){compressedFree.push_back(pendingFrame);++dropped;}
-                    pendingFrame=target;
-                    if(!compressedFree.empty()){workerFrame=compressedFree.back();compressedFree.pop_back();}
+                    // The decoder may have allocated a P010 target because the
+                    // preallocated NV12 target was incompatible. Publish the
+                    // actual output and recycle the unused supplied target.
+                    if(decodedFrame!=target&&target)compressedFree.push_back(target);
+                    pendingFrame=decodedFrame;
+                    workerFrame=takeCompressedTargetLocked();
                 }
                 pendingIsHardware=hardware;
                 pendingDiscontinuity=(pending&&pendingDiscontinuity)||stamp.bad||recoveryBoundary;
@@ -880,8 +922,17 @@ struct CaptureCardSource::Impl:ISampleGrabberCB {
         bool enqueued=false;uint64_t timingSequence=0;int64_t copied100ns=0;double lockWaitMs=0,arrivalDeltaMs=0,ptsDeltaMs=0;
         // Native path: claim the staging frame, copy outside the lock.
         AVFrame* staged=nullptr;bool stagedOk=false,probeNow=false,commitPicture=false;CaptureSignalSample signalSample;
+        CompressedPayloadPtr compressedPayload;
         // A new picture's reference copy runs when this call returns (every path), after the publish below.
         struct CommitAfterPublish{Impl& p;const uint8_t* data;bool& owed;~CommitAfterPublish(){if(owed)commitCaptureSample(p.layout,data,p.pictureReference);}} commitLater{*this,data,commitPicture};
+        if(valid&&compressedPath){
+            // MJPEG 4K payloads are several MB. Do that copy before taking the
+            // mailbox lock, mirroring the native staging-frame path; otherwise
+            // every compressed callback blocks the decode worker and the reader
+            // for the full memcpy.
+            {std::lock_guard lock(mutex);compressedPayload=takePayload();}
+            compressedPayload->assign(data,size_t(sample->GetActualDataLength()));
+        }
         if(valid&&!compressedPath){
             {std::lock_guard lock(mutex);if(stagingFrame&&!stagingBusy){stagingBusy=true;staged=stagingFrame;}
                 if(signalProbeEnabled&&arrival>=nextSignalProbe){nextSignalProbe=arrival+std::chrono::seconds(1);probeNow=true;}}
@@ -928,9 +979,7 @@ struct CaptureCardSource::Impl:ISampleGrabberCB {
                 if(compressedPath){
                     // MPEG chain: the callback only copies the compressed
                     // payload; the decode worker produces the NV12 frame.
-                    const auto* payload=reinterpret_cast<const uint8_t*>(data);
-                    const size_t bytes=size_t(sample->GetActualDataLength());
-                    CompressedSample entry;entry.payload=takePayload();entry.payload.assign(payload,payload+bytes);
+                    CompressedSample entry;entry.payload=std::move(compressedPayload);
                     if(compressedQueue.size()>=compressedQueueLimit){
                         // MJPEG is intra-only: dropping a queued packet skips one picture and
                         // leaves every other frame and its timestamp intact. It is counted
@@ -1226,6 +1275,7 @@ bool CaptureCardSource::configureDeckLink(const SourceOpenDesc& desc){
     layout.rowBytes=unsigned(decklink::rowBytes(input.pixel,input.width));layout.sampleBytes=size_t(input.stride)*input.height;
     layout.bottomUp=input.bottomUp;layout.duration=input.duration100ns;layout.color=input.color;
     applyCaptureColorOverride(layout.color,selection.colorOverride);
+    pipeline::enableCaptureChromaReconstruction(layout.color);
     switch(input.pixel){
     case decklink::Pixel::Uyvy8:layout.packing=CapturePacking::Uyvy;layout.format=AV_PIX_FMT_UYVY422;break;
     case decklink::Pixel::Bgra8:layout.packing=CapturePacking::Bgra32;layout.format=AV_PIX_FMT_BGR0;break; // capture is opaque, ignore undefined alpha
@@ -1558,7 +1608,7 @@ bool CaptureCardSource::configureDevice(const SourceOpenDesc& desc) {
     // instead of repeating one sample over a 2x2 block. Until now only PS5
     // Remote Play asked for this; OBS filters capture chroma bilinearly too.
     // Packed 4:2:2 formats interpolate in their own ingress shaders.
-    p.layout.color.reconstructChroma=true;
+    pipeline::enableCaptureChromaReconstruction(p.layout.color);
     const auto reportedSite = p.layout.color.chromaLocation;
     if (!compressedPath && configureDx20rChroma(p.layout, deviceName, devicePath)) {
         log::info("capture-chroma", std::format("DX20R NV12 site={} source={} lumaGuide={}",
@@ -1683,14 +1733,20 @@ bool CaptureCardSource::configureDevice(const SourceOpenDesc& desc) {
             for(auto& decoder:p.extraDecoders)p.extraDecodeThreads.emplace_back([&p,raw=decoder.get()]{p.mjpegLoop(*raw);});
             log::info("capture-decode",std::format("parallel MJPEG decode workers={} targets={} uploadBacked={} queue={}",1+p.extraDecoders.size(),p.compressedFree.size(),uploadTargets,p.compressedQueueLimit));
         }else{
+        unsigned uploadTargets=0;
         for(int i=0;i<2;++i){
-            AVFrame* frame=av_frame_alloc();if(!frame)return false;
-            frame->format=AV_PIX_FMT_NV12;frame->width=int(p.layout.width);frame->height=int(p.layout.height);
-            if(av_frame_get_buffer(frame,32)<0){av_frame_free(&frame);return false;}
+            AVFrame* frame=GetEnvironmentVariableW(L"VEYRA_TEST_CAPTURE_CPU_FRAMES",nullptr,0)==0?
+                pipeline::allocCaptureUploadFrame(static_cast<ID3D12Device*>(desc.d3d12Device),AV_PIX_FMT_NV12,p.layout.width,p.layout.height):nullptr;
+            if(frame)++uploadTargets;
+            else{
+                frame=av_frame_alloc();if(!frame)return false;
+                frame->format=AV_PIX_FMT_NV12;frame->width=int(p.layout.width);frame->height=int(p.layout.height);
+                if(av_frame_get_buffer(frame,32)<0){av_frame_free(&frame);return false;}
+            }
             if(i==0)p.workerFrame=frame;else p.compressedFree.push_back(frame);
         }
         p.decodeStop=false;p.decodeThread=std::thread([&p]{p.decodeLoop();});
-        log::info("capture-decode",std::format("decode worker started queue={} backend={} (single decode thread)",p.compressedQueueLimit,p.compressedDecoder.backendName()));
+        log::info("capture-decode",std::format("decode worker started queue={} uploadBacked={} backend={} (single decode thread)",p.compressedQueueLimit,uploadTargets,p.compressedDecoder.backendName()));
         }
     }
     p.elgatoHdr=std::move(elgatoHdr);
@@ -2461,7 +2517,7 @@ SourceReadStatus CaptureCardSource::readWithWait(pipeline::FramePacket& packet,c
             if(p.frame)p.compressedFree.push_back(p.frame);
             p.frame=p.pendingFrame;p.pendingFrame=nullptr;delivered=p.frame;
             if(p.mjpegParallel)feedDecode=true; // the released frame is a decode target again
-            else if(p.workerFrame==nullptr&&!p.compressedFree.empty()){p.workerFrame=p.compressedFree.back();p.compressedFree.pop_back();feedDecode=true;}
+            else if(p.workerFrame==nullptr&&!p.compressedFree.empty()){p.workerFrame=p.takeCompressedTargetLocked();feedDecode=true;}
         }else{
             // Native path keeps the original mailbox rotation: the frame the
             // caller releases becomes the next ingest target, and pendingFrame
@@ -2483,10 +2539,16 @@ SourceReadStatus CaptureCardSource::readWithWait(pipeline::FramePacket& packet,c
     auto colorInfo=p.info.color;
     if(p.compressedPath){
         // Compressed video carries its own VUI metadata; the negotiated layout
-        // stays the declared fallback. D3D12VA surfaces report NV12 by
-        // contract (the capture ingress contract is 8-bit for this path).
+        // stays the declared fallback. Hardware frames resolve NV12/P010 from
+        // their FFmpeg hardware frames context, not from the D3D11/D3D12 tag.
         colorInfo=resolveCompressedCaptureColor(*delivered,p.layout.color,p.compressedRangeOverride);
-        if(delivered->format==AV_PIX_FMT_D3D12&&colorInfo.pixelFormat==pipeline::SourcePixelFormat::Unknown)colorInfo.pixelFormat=pipeline::SourcePixelFormat::NV12;
+        if((delivered->format==AV_PIX_FMT_D3D12||delivered->format==AV_PIX_FMT_D3D11)&&colorInfo.pixelFormat==pipeline::SourcePixelFormat::Unknown)colorInfo.pixelFormat=pipeline::SourcePixelFormat::NV12;
+        pipeline::enableCaptureChromaReconstruction(colorInfo);
+        // The advertised compressed fallback is NV12 because the bit depth is
+        // not knowable before the first picture. Once FFmpeg/bitstream metadata
+        // resolves the real format, publish it so the engine can rebuild the
+        // ingress contract instead of silently reducing P010 to NV12.
+        p.info.color=colorInfo;
     }
     delivered->pts=p.decklink?nativeTime100ns:static_cast<int64_t>(time*10000000);delivered->duration=duration.isUnknown()?0:duration.to100ns();delivered->time_base={1,10000000};packet={};packet.pts={delivered->pts,10000000};packet.duration=duration;packet.colorInfo=colorInfo;packet.sourceKind=pipeline::SourceKind::CaptureCard;packet.sequence=sequence;packet.flags=flags;packet.sourceEpoch=1;
     packet.sequence+=receivedOffset_;packet.sourceEpoch=epoch_;

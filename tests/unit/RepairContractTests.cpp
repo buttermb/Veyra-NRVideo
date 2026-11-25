@@ -645,9 +645,14 @@ int main(){
             "format rank: NV12 < YUY2 < RGB24 < RGB565 < decoded");
         check(veyra::source::captureFormatTier(CapturePacking::Nv12)==CaptureFormatTier::Low&&
             veyra::source::captureFormatTier(CapturePacking::Bgr24)==CaptureFormatTier::Medium&&
+            veyra::source::captureFormatTier(CapturePacking::V210)==CaptureFormatTier::Medium&&
+            veyra::source::captureFormatTier(CapturePacking::Rgb10xLE)==CaptureFormatTier::Medium&&
             veyra::source::captureFormatTier(CapturePacking::Rgb565)==CaptureFormatTier::High&&
             veyra::source::captureFormatTier(CapturePacking::Unknown)==CaptureFormatTier::Decoded,
-            "format tiers: low/medium/high/decoded");
+            "format tiers: low/medium/high/decoded, with direct GPU 10-bit formats no longer mislabeled as decoder paths");
+        check(veyra::source::captureFormatRank(CapturePacking::V210)<veyra::source::captureFormatRank(CapturePacking::Unknown)&&
+            veyra::source::captureFormatRank(CapturePacking::Rgb10xLE)<veyra::source::captureFormatRank(CapturePacking::Unknown),
+            "direct GPU v210/R10l formats sort before compressed or system-converted input");
         check(veyra::source::captureFormatNeedsCostHint(CaptureFormatTier::High)&&veyra::source::captureFormatNeedsCostHint(CaptureFormatTier::Decoded)&&
             !veyra::source::captureFormatNeedsCostHint(CaptureFormatTier::Medium),"cost hint only for high/decoded formats");
         std::vector<CapturePacking> order{CapturePacking::Rgb565,CapturePacking::Unknown,CapturePacking::Yuy2,CapturePacking::Nv12};

@@ -2513,9 +2513,9 @@ bool EnhanceGraph::createComputePasses()
     const UINT ingressUavCount = preGradeRgba_ ? 2u : 1u;
     // extraSrvCount covers t8..t14: the five colour-grade tables plus the three
     // Dolby Vision profile 7 enhancement layer planes (luma, chroma, curve).
-    if (!yuvPass_.loadShader("YuvToLinearRgb.dxil", cs) || !yuvPass_.create(context_.device(), cs, 16, 2, ingressUavCount, 12+kColorGradeConstantCount+kDolbyVisionP5ConstantCount, 7)) return false;
+    if (!yuvPass_.loadShader("YuvToLinearRgb.dxil", cs) || !yuvPass_.create(context_.device(), cs, 16, 2, ingressUavCount, 12+kColorGradeConstantCount+kDolbyVisionP5ConstantCount, 7, true)) return false;
     const char* rgbShader=desc_.packedInput?"PackedCaptureToLinear.dxil":desc_.yuy2Input?"Yuy2ToLinear.dxil":"RgbToLinear.dxil";
-    if((desc_.rgbInput||desc_.yuy2Input||desc_.packedInput)&&(!rgbPass_.loadShader(rgbShader,cs)||!rgbPass_.create(context_.device(),cs,12,1,ingressUavCount,(desc_.packedInput?12:8)+kColorGradeConstantCount,4)))return false;
+    if((desc_.rgbInput||desc_.yuy2Input||desc_.packedInput)&&(!rgbPass_.loadShader(rgbShader,cs)||!rgbPass_.create(context_.device(),cs,12,1,ingressUavCount,(desc_.packedInput?12:8)+kColorGradeConstantCount,4,desc_.yuy2Input||desc_.packedInput)))return false;
     // Descriptor budget grows with the NR stack: encode needs one SRV+UAV pair
     // per layer, decode needs three SRVs and one UAV per layer. The base 8
     // slots the single-layer graph always used are kept as the floor.
@@ -3555,9 +3555,11 @@ bool EnhanceGraph::process(const AVFrame* frame, double ptsMs, bool reset, Frame
         constexpr float neutral[]={0.18f,0.18f,0.18f,1.0f};
         list->ClearUnorderedAccessViewFloat(gpu,cpu,target,neutral,0,nullptr);
     }else if(desc_.rgbInput||desc_.yuy2Input||desc_.packedInput){
+        const unsigned chromaMode=resolved.reconstructChroma?std::max(1u,unsigned(resolved.chromaLocation)):0u;
         float c[12+kColorGradeConstantCount]={uintBits(srcW_),uintBits(srcH_),uintBits(resolved.transfer==TransferFunction::PQ?4u:resolved.transfer==TransferFunction::HLG?5u:workingTransferCode(resolved)),uintBits(resolved.range==ColorRange::Limited?1u:0u),
             resolved.range==ColorRange::Full?0.0f:1.0f,resolved.matrix==YuvMatrix::BT2020NCL?2.0f:resolved.matrix==YuvMatrix::BT601?0.0f:1.0f,resolved.primaries==ColorPrimaries::BT2020?1.0f:0.0f,uintBits(desc_.packedInput)};
-        if(desc_.packedInput){c[8]=desc_.hdrWorking()?1.f:0.f;c[9]=toneMapPeakNits_;c[10]=203.f;}
+        if(desc_.packedInput){c[8]=desc_.hdrWorking()?1.f:0.f;c[9]=toneMapPeakNits_;c[10]=203.f;c[11]=uintBits(chromaMode);}
+        else c[7]=uintBits(chromaMode);
         if(grade)packColorGradeConstants(colorTables_,c+(desc_.packedInput?12:8));
         if(resolved.scRgb){c[4]=desc_.hdrWorking()?1.f:2.f;c[5]=toneMapPeakNits_;}
         rgbPass_.bind(list,c,gpuHandleOf(rgbPass_,gpuRgb?3+parity:0).ptr,gpuHandleOf(rgbPass_,1+uavSlot).ptr,gpuHandleOf(rgbPass_,8).ptr);

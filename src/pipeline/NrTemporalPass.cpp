@@ -36,11 +36,11 @@ bool NrTemporalPass::initialize(ID3D12Device* device,ID3D12Resource* base,ID3D12
     std::vector<uint8_t> shader;
     // 7 SRVs (base, raw, history, guide, motion, low residual, low guide), 3 UAVs,
     // 44 constants: original 24, Route/LowSize/pad, optional 16-float correction.
-    if(!raw_||!pass_.loadShader("NrTemporal.dxil",shader)||!pass_.create(device,shader,20,7,3,44))return false;
+    if(!raw_||!pass_.loadShader("NrTemporal.dxil",shader)||!pass_.create(device,shader,20,7,3,44,0,true))return false;
     if(lowFrequency){
         std::vector<uint8_t> reduce;
         // 3 SRVs + 2 UAVs = 5 slots per phase, two phases.
-        if(!reducePass_.loadShader("NrTemporalReduce.dxil",reduce)||!reducePass_.create(device,reduce,10,3,2,8))return false;
+        if(!reducePass_.loadShader("NrTemporalReduce.dxil",reduce)||!reducePass_.create(device,reduce,10,3,2,24))return false;
         DescriptorStager reduceStaging;if(!reduceStaging.initialize(device,10))return false;
         for(unsigned i=0;i<2;++i){
             // Input and Base are the same image in this graph; the reduce shader
@@ -85,9 +85,10 @@ void NrTemporalPass::run(ID3D12GraphicsCommandList* list,StateTracker& tracker,b
         tracker.transition(list,base_,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         tracker.transition(list,raw_.Get(),D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         for(auto* r:{lowResidual_.Get(),lowGuide_.Get()})tracker.transition(list,r,D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-        const float rc[8]={std::bit_cast<float>(width_),std::bit_cast<float>(height_),
-                           std::bit_cast<float>(lowWidth_),std::bit_cast<float>(lowHeight_),
-                           0.f,protection.enabled?1.f:0.f,0.f,0.f};
+        float rc[24]={std::bit_cast<float>(width_),std::bit_cast<float>(height_),
+                      std::bit_cast<float>(lowWidth_),std::bit_cast<float>(lowHeight_),
+                      0.f,protection.enabled?1.f:0.f,protection.featherPixels,0.f};
+        for(unsigned n=0;n<4;++n){const auto region=engine::protectionConstants(protection.regions[n]);std::copy(region.begin(),region.end(),rc+8+n*4);}
         reducePass_.bind(list,rc,gpuHandleOf(reducePass_,0).ptr,gpuHandleOf(reducePass_,3).ptr);
         list->Dispatch((lowWidth_+7)/8,(lowHeight_+7)/8,1);
         for(auto* r:{lowResidual_.Get(),lowGuide_.Get()}){tracker.uavBarrier(list,r);tracker.transition(list,r,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);}

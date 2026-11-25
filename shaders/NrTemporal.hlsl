@@ -1,8 +1,8 @@
 // Adapted from SAOG0721/Magpie, GPL-3.0, commit
 // 3841698348bfb246623d4acf791984c8b68a577b
 // src/Magpie.Core/DLSSNRTemporalShader.h (motion route 2).
-// Veyra: D3D12 Load-based bilinear sampling, source-flow extent conversion,
-// bounded signed perceptual guide, reset via zero weight, post-protection residual.
+// Veyra: source-flow extent conversion, bounded signed perceptual guide,
+// reset via zero weight, post-protection residual.
 //
 // Anti-flicker tiers (Route, stage 6 of
 // docs/NR_FG_OPTIMIZATION_PLAN_2026-09-29.md). Route numbers follow the upstream
@@ -24,6 +24,7 @@ Texture2D<float4> PreviousGuide:register(t3);
 Texture2D<float2> Motion:register(t4);
 Texture2D<float4> LowResidual:register(t5);
 Texture2D<float4> LowGuide:register(t6);
+SamplerState LinearClamp:register(s1);
 RWTexture2D<float4> Output:register(u0);
 RWTexture2D<float4> NextHistory:register(u1);
 RWTexture2D<float4> NextGuide:register(u2);
@@ -59,15 +60,18 @@ float RebaseResidual(float base,float raw,float correction){
 }
 bool Inside(int2 p){return all(p>=0)&&all(p<int2(Size));}
 float4 Bilinear(Texture2D<float4> tex,float2 p){
-    int2 a=int2(floor(p));float2 f=frac(p);int2 b=min(a+1,int2(Size)-1);
-    return lerp(lerp(tex[a],tex[int2(b.x,a.y)],f.x),lerp(tex[int2(a.x,b.y)],tex[b],f.x),f.y);
+    // Integer texel coordinates are texel centers, so adding 0.5 makes this
+    // exactly the same four-tap filter as the manual Load/lerp sequence while
+    // letting the texture unit select and clamp the taps.
+    return tex.SampleLevel(LinearClamp,(p+0.5)/float2(Size),0);
 }
 bool PreviousPosition(int2 p,out float2 previous){
     previous=p;if(!Inside(p))return false;
     uint w,h;Motion.GetDimensions(w,h);
-    float2 at=(float2(p)+.5)*float2(w,h)/Size-.5;
-    int2 a=int2(floor(at));float2 f=frac(at);int2 hi=int2(w,h)-1;
-    float2 mv=lerp(lerp(Motion[clamp(a,0,hi)],Motion[clamp(a+int2(1,0),0,hi)],f.x),lerp(Motion[clamp(a+int2(0,1),0,hi)],Motion[clamp(a+1,0,hi)],f.x),f.y)*float2(Size)/float2(w,h);
+    // Sampling at this output pixel's normalized position is algebraically
+    // identical to the previous manual resample of the lower-resolution flow
+    // texture, but uses one hardware bilinear fetch instead of four loads.
+    float2 mv=Motion.SampleLevel(LinearClamp,(float2(p)+.5)/float2(Size),0)*float2(Size)/float2(w,h);
     if(!all(isfinite(mv)))return false;previous+=mv;
     return all(previous>=0)&&all(previous<=float2(Size)-1);
 }
@@ -130,14 +134,30 @@ groupshared float TileError[100];
         for(uint tap=lane;tap<100;tap+=64){
             int2 n=int2(id.xy)-int2(local.xy)+int2(tap%10,tap/10)-1;
             float2 oldPosition;float4 residual=0,position=0;float error=0;
+            float4 inputN=0;bool haveInput=false;float lowValid=0;float3 lowN=0;
+            // Route 4 used to rebuild this same low-frequency observation again
+            // inside every centre pixel's 3x3 loop. The observation depends only
+            // on the tap pixel, so compute it once while populating the shared
+            // tile and carry its validity in the spare position channel.
+            if(Route==4&&Inside(n)){
+                inputN=Base[n];haveInput=true;
+                if(all(isfinite(inputN))&&Reconstruct(n,Guide(inputN.rgb),lowN))lowValid=1;
+                residual=float4(lowN,0);
+                position.w=lowValid;
+            }
             if(PreviousPosition(n,oldPosition)){
-                float4 inputN=Base[n],old=Bilinear(PreviousGuide,oldPosition);
-                float3 residualN=Raw[n].rgb-inputN.rgb;
-                bool valid=all(isfinite(inputN))&&all(isfinite(old))&&old.a>=.999&&all(isfinite(residualN));
+                if(!haveInput)inputN=Base[n];
+                float4 old=Bilinear(PreviousGuide,oldPosition);
+                const float3 fullResidual=Raw[n].rgb-inputN.rgb;
+                float3 residualN=Route==4?lowN:fullResidual;
+                // Preserve the original validity contract: even on route 4 the
+                // full-band observation is the finiteness gate; the low-pass
+                // reconstruction only replaces the quantity being filtered.
+                bool valid=all(isfinite(inputN))&&all(isfinite(old))&&old.a>=.999&&all(isfinite(fullResidual))&&(Route!=4||lowValid>0);
                 float3 delta=abs(Guide(inputN.rgb)-old.rgb);
                 error=max(delta.r,max(delta.g,delta.b));
                 residual=float4(residualN,valid?1:0);
-                position=float4(oldPosition,1,0);
+                position=float4(oldPosition,1,lowValid);
             }
             TileResidual[tap]=residual;TilePosition[tap]=position;TileError[tap]=error;
         }
@@ -154,14 +174,17 @@ groupshared float TileError[100];
     // low-frequency component and `detail` carries this frame's exact
     // high-frequency complement through untouched.
     float3 detail=0;
+    uint center=(local.y+1)*10+local.x+1;
     if(Route==4){
-        float3 low;
-        if(!Reconstruct(p,Guide(base.rgb),low)){NextHistory[p]=0;Output[p]=raw;return;}
+        float3 low;bool haveLow=false;
+        if(HistoryWeight>0&&TilePosition[center].w>0){low=TileResidual[center].rgb;haveLow=true;}
+        else haveLow=Reconstruct(p,Guide(base.rgb),low);
+        if(!haveLow){NextHistory[p]=0;Output[p]=raw;return;}
         detail=(raw.rgb-base.rgb)-low;
         // `result` below now accumulates the low-frequency observation, so the
         // residual used for the guide/box comparison must be the same signal.
         // The tile cache above holds the full-band residual for route 2/3; for
-        // route 4 the per-pixel comparison is replaced below.
+        // route 4 it holds the reconstructed low-frequency observation.
     }
     // Protected/feathered pixels are excluded from history entirely: the caller
     // composites the original image there, so nothing this pass emits should be
@@ -178,10 +201,8 @@ groupshared float TileError[100];
     float3 result=current;float2 previous;
     // Route 3 carries a support channel in history alpha: the residual is only
     // applied in proportion to how strongly the source is currently observed.
-    float support=saturate(smoothstep(.005,.02,max(abs(Guide(raw.rgb)-Guide(base.rgb)).r,
-                                                 max(abs(Guide(raw.rgb)-Guide(base.rgb)).g,
-                                                     abs(Guide(raw.rgb)-Guide(base.rgb)).b))));
-    uint center=(local.y+1)*10+local.x+1;
+    const float3 supportDelta=abs(Guide(raw.rgb)-Guide(base.rgb));
+    float support=saturate(smoothstep(.005,.02,max(supportDelta.r,max(supportDelta.g,supportDelta.b))));
     if(observesCorrection&&HistoryWeight>0&&TilePosition[center].z>0){
         previous=TilePosition[center].xy;
         float error=0,maximumError=0;bool valid=true;float3 lo=current,hi=current;
@@ -192,11 +213,13 @@ groupshared float TileError[100];
             if(any(abs((previousN-n)-(previous-p))>2)){valid=false;continue;}
             float3 residualN=TileResidual[tap].rgb;
             if(TileResidual[tap].a==0){valid=false;continue;}
-            // Route 4 accumulates a half-resolution signal, so the full-band tile
-            // residual is not the quantity being filtered. Its spatial agreement
-            // still gates motion validity, but the box must come from the
-            // reconstructed low-frequency observation instead.
-            if(Route==4){float3 lowN;if(!Reconstruct(n,Guide(Base[n].rgb),lowN)){valid=false;continue;}residualN=lowN;}
+            // Route 4 accumulates the half-resolution observation prepared with
+            // the tile. This is the same value the repeated local reconstruction
+            // produced, without nine half-resolution gathers per output pixel.
+            if(Route==4){
+                if(TilePosition[tap].w==0){valid=false;continue;}
+                residualN=TileResidual[tap].rgb;
+            }
             float e=TileError[tap];error+=e/9;maximumError=max(maximumError,e);lo=min(lo,residualN);hi=max(hi,residualN);
         }
         float q=(1-smoothstep(.008,.04,error))*(1-smoothstep(.025,.10,maximumError));

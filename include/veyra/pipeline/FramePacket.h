@@ -158,7 +158,7 @@ struct ColorDescription {
     bool matrixAssumed = false;
     bool transferAssumed = false;
     bool primariesAssumed = false;
-    // PS5 opt-in reconstruction; legacy file/capture/export sampling is unchanged.
+    // PS5/live-capture opt-in reconstruction; legacy file/export sampling is unchanged.
     ChromaLocation chromaLocation = ChromaLocation::Unknown;
     bool reconstructChroma = false;
     bool guideChromaWithLuma = false;

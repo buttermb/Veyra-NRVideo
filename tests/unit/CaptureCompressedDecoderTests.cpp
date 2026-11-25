@@ -8,11 +8,13 @@
 #include "veyra/source/CaptureCompressedDecoder.h"
 #include "veyra/gfx/D3D12DeviceContext.h"
 #include "veyra/media/FFmpegVideoDecoder.h"
+#include "veyra/pipeline/CaptureUploadFrame.h"
 
 #include <iostream>
 #include <filesystem>
 #include <algorithm>
 #include <map>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -120,7 +122,7 @@ struct DecodeRun {
     bool recovered=false;
 };
 
-DecodeRun decodeAll(ElementaryStream& stream, ID3D12Device* device, ID3D12CommandQueue* queue,bool injectLoss=false)
+DecodeRun decodeAll(ElementaryStream& stream, ID3D12Device* device, ID3D12CommandQueue* queue,bool injectLoss=false,bool ownedPackets=false)
 {
     DecodeRun run;
     source::CaptureCompressedDecoder decoder;
@@ -147,7 +149,12 @@ DecodeRun decodeAll(ElementaryStream& stream, ID3D12Device* device, ID3D12Comman
         if(injectLoss&&inputIndex>=7&&inputIndex<10){++inputIndex;continue;}
         AVFrame* out = nullptr;
         bool hardware = false;
-        const bool produced = decoder.decode(unit.data(), unit.size(), stream.pts[inputIndex++], target, &out, hardware);
+        bool produced=false;
+        if(ownedPackets){
+            auto payload=std::make_shared<source::CompressedPayload>();
+            payload->assign(unit.data(),unit.size());
+            produced=decoder.decodeOwned(payload,stream.pts[inputIndex++],target,&out,hardware);
+        }else produced=decoder.decode(unit.data(), unit.size(), stream.pts[inputIndex++], target, &out, hardware);
         if (produced) {
             ++run.frames;
             if(!injectLoss&&(run.frames>displayPts.size()||out->pts!=displayPts[run.frames-1])){++run.failures;run.firstError="decoded PTS was lost or assigned from current packet";}
@@ -226,6 +233,38 @@ bool packetRetryTest(const char* path,gfx::D3D12DeviceContext& device) {
 
 // Exercise the real codec's hard-error/reset boundary used by Xbox. This is
 // a local H.264 replay, not a real Xbox/RX9000 driver reproduction.
+// The capture worker writes software conversions directly into write-combined
+// upload memory. One reference-identical frame is enough to prove that the
+// non-temporal chroma stores preserve the exact bytes; reading every frame
+// back from WC memory would make the test cost dominate what it measures.
+bool uploadBackedSoftwareDecodeTest(ElementaryStream& stream, gfx::D3D12DeviceContext& device,
+    const std::map<int64_t,uint32_t>& expectedPixels) {
+    source::CaptureCompressedDecoder decoder;
+    if (!decoder.open(stream.codec, unsigned(stream.width), unsigned(stream.height), nullptr, 0, nullptr, nullptr)) return false;
+    AVFrame* target = pipeline::allocCaptureUploadFrame(device.device(), AV_PIX_FMT_NV12, unsigned(stream.width), unsigned(stream.height));
+    if (!target) return false;
+    bool ok = false, failed = false;
+    for (size_t i = 0; i < stream.accessUnits.size() && !ok && !failed; ++i) {
+        pipeline::selectCaptureUploadTarget(*target);
+        AVFrame* out = nullptr;
+        bool hardware = false;
+        const auto& unit = stream.accessUnits[i];
+        if (!decoder.decode(unit.data(), unit.size(), stream.pts[i], target, &out, hardware)) {
+            failed = !decoder.waitingForInput();
+            continue;
+        }
+        uint32_t checksum = 1;
+        for (int plane = 0; plane < 2; ++plane) for (int y = 0; y < (plane ? out->height / 2 : out->height); ++y)
+            checksum = av_adler32_update(checksum, out->data[plane] + ptrdiff_t(y) * out->linesize[plane], out->width);
+        const auto expected = expectedPixels.find(out->pts);
+        ok = !hardware && out == target && pipeline::captureUploadDirectTarget(*target) &&
+            expected != expectedPixels.end() && expected->second == checksum;
+        failed = !ok;
+    }
+    av_frame_free(&target);
+    return ok && !failed;
+}
+
 bool hardErrorRecovery(ElementaryStream& stream, ID3D12Device* device, ID3D12CommandQueue* queue) {
     if(stream.codec!=source::CaptureCodec::H264)return true;
     source::CaptureCompressedDecoder decoder;
@@ -327,6 +366,128 @@ bool decoderReplacement(ElementaryStream& stream, gfx::D3D12DeviceContext& devic
     decoder.close();av_frame_free(&held);av_frame_free(&target);return ok;
 }
 
+
+struct TestFrameDeleter { void operator()(AVFrame* frame) const { av_frame_free(&frame); } };
+using TestFramePtr = std::unique_ptr<AVFrame, TestFrameDeleter>;
+
+bool sameP010Pixels(const AVFrame& reference, const AVFrame& output)
+{
+    if (reference.width != output.width || reference.height != output.height || output.format != AV_PIX_FMT_P010 ||
+        !reference.data[0] || !reference.data[1] || !output.data[0] || !output.data[1]) return false;
+    const size_t lumaBytes = size_t(output.width) * 2;
+    if (reference.format == AV_PIX_FMT_P010) {
+        for (int plane = 0; plane < 2; ++plane) {
+            const int rows = plane ? output.height / 2 : output.height;
+            for (int y = 0; y < rows; ++y)
+                if (std::memcmp(reference.data[plane] + ptrdiff_t(y) * reference.linesize[plane],
+                    output.data[plane] + ptrdiff_t(y) * output.linesize[plane], lumaBytes) != 0) return false;
+        }
+        return true;
+    }
+    if (reference.format != AV_PIX_FMT_YUV420P10LE || !reference.data[2]) return false;
+    for (int y = 0; y < output.height; ++y) {
+        const auto* in = reinterpret_cast<const uint16_t*>(reference.data[0] + ptrdiff_t(y) * reference.linesize[0]);
+        const uint8_t* out = output.data[0] + ptrdiff_t(y) * output.linesize[0];
+        for (int x = 0; x < output.width; ++x) {
+            const uint16_t actual = uint16_t(out[2 * x] | (uint16_t(out[2 * x + 1]) << 8));
+            if (actual != uint16_t(in[x] << 6)) return false;
+        }
+    }
+    for (int y = 0; y < output.height / 2; ++y) {
+        const auto* u = reinterpret_cast<const uint16_t*>(reference.data[1] + ptrdiff_t(y) * reference.linesize[1]);
+        const auto* v = reinterpret_cast<const uint16_t*>(reference.data[2] + ptrdiff_t(y) * reference.linesize[2]);
+        const uint8_t* out = output.data[1] + ptrdiff_t(y) * output.linesize[1];
+        for (int x = 0; x < output.width / 2; ++x) {
+            const uint16_t actualU = uint16_t(out[4 * x] | (uint16_t(out[4 * x + 1]) << 8));
+            const uint16_t actualV = uint16_t(out[4 * x + 2] | (uint16_t(out[4 * x + 3]) << 8));
+            if (actualU != uint16_t(u[x] << 6) || actualV != uint16_t(v[x] << 6)) return false;
+        }
+    }
+    return true;
+}
+
+// 10-bit compressed input must not be quantized to 8-bit merely because the
+// preallocated capture target is NV12. The first picture allocates a P010
+// output; that output is then supplied back to the decoder and must be reused.
+bool tenBitSoftwareOutputTest(const ElementaryStream& stream)
+{
+    if (stream.codec != source::CaptureCodec::Hevc) return false;
+    AVCodecParameters* parameters = avcodec_parameters_alloc();
+    if (!parameters) return false;
+    parameters->codec_type = AVMEDIA_TYPE_VIDEO;
+    parameters->codec_id = AV_CODEC_ID_HEVC;
+    parameters->width = stream.width;
+    parameters->height = stream.height;
+    media::FFmpegVideoDecoder reference;
+    bool ok = reference.openSoftware(parameters, 1, 10000000, 1, true);
+    avcodec_parameters_free(&parameters);
+    if (!ok) return false;
+    std::map<int64_t, TestFramePtr> referenceFrames;
+    AVPacket* packet = av_packet_alloc();
+    auto drainReference = [&] {
+        while (const AVFrame* frame = reference.receiveFrame()) {
+            if (AVFrame* copy = av_frame_clone(frame)) referenceFrames[frame->pts].reset(copy);
+        }
+    };
+    for (size_t i = 0; ok && i < stream.accessUnits.size(); ++i) {
+        if (av_new_packet(packet, int(stream.accessUnits[i].size())) < 0) { ok = false; break; }
+        std::memcpy(packet->data, stream.accessUnits[i].data(), stream.accessUnits[i].size());
+        packet->pts = stream.pts[i];
+        ok = reference.sendPacket(packet);
+        av_packet_unref(packet);
+        drainReference();
+    }
+    ok = ok && reference.sendPacket(nullptr);
+    drainReference();
+    av_packet_free(&packet);
+    reference.close();
+    if (!ok || referenceFrames.empty()) return false;
+
+    source::CaptureCompressedDecoder decoder;
+    if (!decoder.open(stream.codec, unsigned(stream.width), unsigned(stream.height), nullptr, 0, nullptr, nullptr)) return false;
+    AVFrame* supplied = av_frame_alloc();
+    if (!supplied) return false;
+    supplied->format = AV_PIX_FMT_NV12;
+    supplied->width = stream.width;
+    supplied->height = stream.height;
+    ok = av_frame_get_buffer(supplied, 32) >= 0;
+    AVFrame* target = supplied;
+    TestFramePtr adopted;
+    unsigned produced = 0, compared = 0;
+    for (size_t i = 0; ok && i < stream.accessUnits.size() && produced < 4; ++i) {
+        AVFrame* out = nullptr;
+        bool hardware = false;
+        const auto& unit = stream.accessUnits[i];
+        if (!decoder.decode(unit.data(), unit.size(), stream.pts[i], target, &out, hardware)) {
+            ok = decoder.waitingForInput();
+            continue;
+        }
+        ++produced;
+        ok = !hardware && out && out->format == AV_PIX_FMT_P010 &&
+            decoder.softwareTargetFormat() == int(AV_PIX_FMT_P010);
+        if (!ok) break;
+        if (produced == 1) {
+            ok = out != target;
+            if (out != target) {
+                av_frame_free(&supplied);
+                adopted.reset(out);
+                target = adopted.get();
+            }
+        } else {
+            ok = out == target;
+        }
+        const auto expected = referenceFrames.find(out->pts);
+        ok = ok && expected != referenceFrames.end() && sameP010Pixels(*expected->second, *out);
+        if (ok) ++compared;
+        if (out != target && out != adopted.get()) av_frame_free(&out);
+    }
+    ok = ok && produced >= 2 && compared == produced;
+    std::cout << (ok ? "PASS " : "FAIL ") << "10-bit HEVC software fallback preserves exact P010 pixels frames="
+        << produced << " compared=" << compared << '\n';
+    if (supplied) av_frame_free(&supplied);
+    return ok;
+}
+
 } // namespace
 
 // Xbox may advertise one size while the SPS describes another. The software
@@ -398,6 +559,7 @@ int wmain(int argc, wchar_t** argv)
     if(!packetRetryTest(path,context))++failures;
     const auto hardware = decodeAll(stream, context.device(), context.directQueue());
     const auto software = decodeAll(stream, nullptr, nullptr);
+    const auto softwareOwned = decodeAll(stream, nullptr, nullptr,false,true);
     const auto recovery = decodeAll(stream, nullptr, nullptr,true);
     std::cout << "hardware frames=" << hardware.frames << " failures=" << hardware.failures
         << " sawD3D12=" << hardware.sawHardwareFrame << " error=" << hardware.firstError << '\n';
@@ -411,12 +573,22 @@ int wmain(int argc, wchar_t** argv)
     check(hardware.failures == 0 && hardware.frames > 0, "hardware decode produces frames without errors");
     check(hardware.sawHardwareFrame, "hardware backend returns importable D3D12 frames");
     check(software.failures == 0 && software.frames > 0, "software decode produces frames without errors");
+    bool ownedSame=softwareOwned.failures==0&&softwareOwned.frames==software.frames&&softwareOwned.pixels==software.pixels;
+    check(ownedSame,"owned AVBuffer packets produce reference-identical software output");
+    check(uploadBackedSoftwareDecodeTest(stream,context,software.pixels),"upload-backed software repack produces reference-identical pixels");
     check(softwareScalingTest(stream), "software stream decode accepts a different output height");
     bool samePixels=true;for(const auto& [pts,pixels]:recovery.pixels){auto found=software.pixels.find(pts);samePixels=samePixels&&found!=software.pixels.end()&&found->second==pixels;}
     check(recovery.recovered&&recovery.failures==0&&samePixels,"packet loss resumes at keyframe with reference-identical pixels and PTS");
     check(hardErrorRecovery(stream,nullptr,nullptr),"Xbox hard-error boundary recovers on the software codec");
     check(hardErrorRecovery(stream,context.device(),context.directQueue()),"Xbox hard-error boundary recovers on D3D12VA");
     check(decoderReplacement(stream,context),"Xbox decoder replacement preserves output PTS and old-frame lifetime");
+    if(argc>2){
+        ElementaryStream tenBit;std::string tenBitError;
+        const auto utf8TenBit=std::filesystem::path(argv[2]).u8string();
+        const std::string tenBitStorage(utf8TenBit.begin(),utf8TenBit.end());
+        check(loadAnnexB(tenBitStorage.c_str(),tenBit,tenBitError)&&tenBitSoftwareOutputTest(tenBit),
+            "10-bit HEVC compressed input preserves P010 in the software fallback");
+    }
     // B-frame reordering may emit a slightly different count on the software
     // path; the hardware and software backends must stay within one frame.
     const uint64_t difference = hardware.frames > software.frames ? hardware.frames - software.frames : software.frames - hardware.frames;

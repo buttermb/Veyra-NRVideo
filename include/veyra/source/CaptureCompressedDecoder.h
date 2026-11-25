@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "veyra/source/CaptureCodec.h"
 
@@ -23,6 +24,18 @@ namespace veyra::source {
 // Apply the capture range after decode so the graph's explicit AVFrame
 // metadata read preserves the override on subsequent color resolution.
 pipeline::ColorDescription resolveCompressedCaptureColor(AVFrame&,const pipeline::ColorDescription&,unsigned rangeOverride);
+
+struct CompressedPayload {
+    // FFmpeg bitstream readers may inspect AV_INPUT_BUFFER_PADDING_SIZE bytes
+    // after the logical end. Keep those bytes in the vector while `size`
+    // remains the compressed payload length handed to the decoder.
+    std::vector<uint8_t> storage;
+    size_t size = 0;
+
+    void assign(const uint8_t* data, size_t bytes);
+    const uint8_t* data() const { return storage.data(); }
+};
+using CompressedPayloadPtr = std::shared_ptr<CompressedPayload>;
 
 class CaptureCompressedDecoder {
 public:
@@ -59,13 +72,24 @@ public:
 
     // Decodes one payload; data=nullptr, bytes=0 receives remaining output
     // without submitting input or EOS. Drain this way before the next payload.
-    // On success `*out` is a frame whose lifetime the
-    // caller must not extend past the next decode():
-    //  - hardware=true:  decoder-owned D3D12 surface (AV_PIX_FMT_D3D12);
-    //  - hardware=false: converted into `nv12Target` (owned by the caller).
+    // On success:
+    //  - hardware=true: `*out` is a decoder-owned D3D12 surface whose lifetime
+    //    the caller must not extend past the next decode();
+    //  - hardware=false: `*out` is caller-owned. It is `nv12Target` when that
+    //    target has the output format the picture needs; otherwise it is a
+    //    newly allocated frame. NV12 remains the 8-bit output; 10-bit and
+    //    deeper 4:2:0 sources use P010 instead of being quantized to 8-bit.
+    //    `nv12Target` may be null, in which case the correct target is allocated.
     // Returns false when the payload produced no frame (pending input) or the
     // decoder reported an error; see lastError()/waitingForInput().
     bool decode(const uint8_t* data, size_t bytes, int64_t pts100ns,
+        AVFrame* nv12Target, AVFrame** out, bool& hardware);
+
+    // Same as decode(), but reuses the capture callback's already copied,
+    // padding-equipped payload through FFmpeg's refcounted AVBuffer API
+    // instead of copying it a second time into an AVPacket. A null payload is
+    // the receive-only drain form.
+    bool decodeOwned(const CompressedPayloadPtr& payload, int64_t pts100ns,
         AVFrame* nv12Target, AVFrame** out, bool& hardware);
 
     // For D3D11VA frames (AV_PIX_FMT_D3D11) the texture the graph reads is not
@@ -75,6 +99,9 @@ public:
     bool opened() const;
     bool hardwareActive() const;
     bool waitingForInput() const;
+    // Last decoded software output format, or AV_PIX_FMT_NONE before the first
+    // software picture. Capture workers use it to recycle a matching target.
+    int softwareTargetFormat() const;
     void recoverAtKeyframe();
     const char* backendName() const;
     const std::string& lastError() const;

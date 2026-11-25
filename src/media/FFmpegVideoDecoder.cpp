@@ -624,8 +624,13 @@ bool FFmpegVideoDecoder::hardwareFrameImportable() const
     if (desc.Format != DXGI_FORMAT_NV12 && desc.Format != DXGI_FORMAT_P010) {
         return false;
     }
-    return context_ != nullptr && desc.Width == static_cast<UINT64>(context_->width) &&
-        desc.Height == static_cast<UINT>(context_->height);
+    // H.264/HEVC hardware surfaces are allocated at the coded extent, not the
+    // visible crop: 1920x1080 commonly arrives as a 1920x1088 texture. The
+    // ingress samples only the visible extent by texel index, so reject only
+    // surfaces too small for the advertised picture; do not force the aligned
+    // allocation to be exact.
+    return context_ != nullptr && desc.Width >= static_cast<UINT64>(context_->width) &&
+        desc.Height >= static_cast<UINT>(context_->height);
 }
 
 void FFmpegVideoDecoder::setExtraHardwareFrames(int frames)

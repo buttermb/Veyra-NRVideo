@@ -3,12 +3,15 @@
 extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavutil/avutil.h>
+#include <libavutil/buffer.h>
 #include <libavutil/pixdesc.h>
 #include <libswscale/swscale.h>
 }
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <climits>
 #include <cstring>
 #include <d3d12.h>
 #include <thread>
@@ -64,7 +67,25 @@ int swsColorspaceOf(AVColorSpace space, unsigned height)
     return height > 576 ? SWS_CS_ITU709 : SWS_CS_ITU601;
 }
 
+void releaseCompressedPayload(void* opaque, uint8_t*)
+{
+    delete static_cast<CompressedPayloadPtr*>(opaque);
+}
+
 } // namespace
+
+void CompressedPayload::assign(const uint8_t* data, size_t bytes)
+{
+    // Never shrink the backing vector: a smaller packet must not make the next
+    // larger packet pay for value-initializing bytes that memcpy immediately
+    // overwrites. `size` remains the logical packet length; the retained tail
+    // only supplies FFmpeg's required zero padding.
+    const size_t required = bytes + AV_INPUT_BUFFER_PADDING_SIZE;
+    if (storage.size() < required) storage.resize(required);
+    if (bytes != 0) std::memcpy(storage.data(), data, bytes);
+    std::memset(storage.data() + bytes, 0, AV_INPUT_BUFFER_PADDING_SIZE);
+    size = bytes;
+}
 
 struct CaptureCompressedDecoder::Impl {
     CaptureCodec codec = CaptureCodec::None;
@@ -73,6 +94,8 @@ struct CaptureCompressedDecoder::Impl {
     AVCodecParameters* parameters = nullptr;
     SwsContext* sws = nullptr;
     bool nativeSoftwareExtent = false;
+    ID3D12Device* uploadDevice = nullptr;
+    std::atomic<int> softwareFormat{int(AV_PIX_FMT_NONE)};
     bool stream = false;               // setStreamProfile(): PC / Xbox streaming
     bool hardwareRequested = false;
     bool hardware = false;
@@ -85,42 +108,192 @@ struct CaptureCompressedDecoder::Impl {
 
     ~Impl() { close(); }
 
-    // MJPEG: full-range 4:2:2 / 4:2:0 planes of the target size go straight to
-    // NV12 (luma row copies; chroma rows averaged in pairs for 4:2:2, then
-    // interleaved). swscale's generic scaler did the same reformat several
-    // times slower, and this writer never reads the target, so the target may
-    // be write-combined GPU upload memory.
+    AVPixelFormat softwareOutputFormat(const AVFrame& frame) const
+    {
+        const auto* description = av_pix_fmt_desc_get(AVPixelFormat(frame.format));
+        return description && description->comp[0].depth > 8 ? AV_PIX_FMT_P010 : AV_PIX_FMT_NV12;
+    }
+
+    AVFrame* allocateSoftwareTarget(AVPixelFormat format, int outputWidth, int outputHeight) const
+    {
+        if (uploadDevice) {
+            if (AVFrame* upload = pipeline::allocCaptureUploadFrame(uploadDevice, format, unsigned(outputWidth), unsigned(outputHeight))) return upload;
+        }
+        AVFrame* target = av_frame_alloc();
+        if (!target) return nullptr;
+        target->format = int(format);
+        target->width = outputWidth;
+        target->height = outputHeight;
+        if (av_frame_get_buffer(target, 256) < 0) {
+            av_frame_free(&target);
+            return nullptr;
+        }
+        return target;
+    }
+
+    // Planar 10-bit FFmpeg output stores the sample in the low bits of uint16;
+    // P010 stores the same sample in the high bits. The analysis proxy must be
+    // the actual P010 container bytes because the graph reads the high byte.
+    void samplePlanar10P010Proxy(AVFrame& target, const AVFrame& frame)
+    {
+        auto* info = pipeline::captureUploadFrame(&target);
+        if (!info || info->pixelBytes != 2 || frame.format != AV_PIX_FMT_YUV420P10LE || !frame.data[0]) return;
+        uint8_t* out = info->proxy;
+        for (unsigned y = 0; y < pipeline::CaptureUploadFrame::kProxyHeight; ++y) {
+            const unsigned row = y * unsigned(frame.height) / pipeline::CaptureUploadFrame::kProxyHeight;
+            const auto* line = reinterpret_cast<const uint16_t*>(frame.data[0] + ptrdiff_t(row) * frame.linesize[0]);
+            for (unsigned x = 0; x < pipeline::CaptureUploadFrame::kProxyWidth; ++x) {
+                const uint16_t value = uint16_t(line[x * unsigned(frame.width) / pipeline::CaptureUploadFrame::kProxyWidth] << 6);
+                *out++ = uint8_t(value);
+                *out++ = uint8_t(value >> 8);
+            }
+        }
+        info->proxyValid = true;
+    }
+
+    // 8-bit planar 4:2:0 of the target size goes straight to NV12 (luma row
+    // copies, chroma interleave). This is a pure repacking: unlike swscale it
+    // cannot introduce an extra range/resize filtering step. MJPEG 4:2:2 also
+    // uses it after averaging vertical chroma pairs; other codecs' 4:2:2 stays
+    // on swscale because that subsampling conversion needs a real filter.
+    // The writer never reads the target, so the target may be write-combined
+    // GPU upload memory.
     bool planarToNv12(const AVFrame& frame, AVFrame* target)
     {
+        const unsigned outputWidth = unsigned(target->width), outputHeight = unsigned(target->height);
         const bool is422 = frame.format == AV_PIX_FMT_YUVJ422P || frame.format == AV_PIX_FMT_YUV422P;
         const bool is420 = frame.format == AV_PIX_FMT_YUVJ420P || frame.format == AV_PIX_FMT_YUV420P;
-        if (codec != CaptureCodec::Mjpeg || !(is422 || is420) || frame.width != int(width) || frame.height != int(height) ||
-            width % 2 || height % 2 || !frame.data[0] || !frame.data[1] || !frame.data[2] || !target->data[0] || !target->data[1] ||
-            target->linesize[0] < int(width) || target->linesize[1] < int(width)) return false;
-        for (unsigned y = 0; y < height; ++y)
-            std::memcpy(target->data[0] + ptrdiff_t(y) * target->linesize[0], frame.data[0] + ptrdiff_t(y) * frame.linesize[0], width);
-        const unsigned chromaWidth = width / 2;
-        for (unsigned row = 0; row < height / 2; ++row) {
+        const bool supported = is420 || (codec == CaptureCodec::Mjpeg && is422);
+        if (!supported || frame.width != int(outputWidth) || frame.height != int(outputHeight) ||
+            outputWidth % 2 || outputHeight % 2 || !frame.data[0] || !frame.data[1] || !frame.data[2] || !target->data[0] || !target->data[1] ||
+            target->linesize[0] < int(outputWidth) || target->linesize[1] < int(outputWidth)) return false;
+        // Decoder and upload pitches commonly agree at widths aligned to the
+        // D3D12 pitch granularity (for example 3840). Copy the whole plane in
+        // one call then instead of issuing thousands of row copies per frame.
+        if (target->linesize[0] == frame.linesize[0] && outputHeight > 1)
+            std::memcpy(target->data[0], frame.data[0], size_t(frame.linesize[0]) * (outputHeight - 1) + outputWidth);
+        else for (unsigned y = 0; y < outputHeight; ++y)
+            std::memcpy(target->data[0] + ptrdiff_t(y) * target->linesize[0], frame.data[0] + ptrdiff_t(y) * frame.linesize[0], outputWidth);
+        const bool streaming = pipeline::captureUploadDirectTarget(*target);
+        const unsigned chromaWidth = outputWidth / 2;
+        for (unsigned row = 0; row < outputHeight / 2; ++row) {
             const unsigned sourceRow = is422 ? row * 2 : row;
             const uint8_t* u0 = frame.data[1] + ptrdiff_t(sourceRow) * frame.linesize[1];
             const uint8_t* v0 = frame.data[2] + ptrdiff_t(sourceRow) * frame.linesize[2];
-            const uint8_t* u1 = is422 ? u0 + frame.linesize[1] : u0;
-            const uint8_t* v1 = is422 ? v0 + frame.linesize[2] : v0;
             uint8_t* out = target->data[1] + ptrdiff_t(row) * target->linesize[1];
             unsigned x = 0;
-            for (; x + 16 <= chromaWidth; x += 16) {
-                const __m128i u = _mm_avg_epu8(_mm_loadu_si128(reinterpret_cast<const __m128i*>(u0 + x)), _mm_loadu_si128(reinterpret_cast<const __m128i*>(u1 + x)));
-                const __m128i v = _mm_avg_epu8(_mm_loadu_si128(reinterpret_cast<const __m128i*>(v0 + x)), _mm_loadu_si128(reinterpret_cast<const __m128i*>(v1 + x)));
-                _mm_storeu_si128(reinterpret_cast<__m128i*>(out + 2 * x), _mm_unpacklo_epi8(u, v));
-                _mm_storeu_si128(reinterpret_cast<__m128i*>(out + 2 * x + 16), _mm_unpackhi_epi8(u, v));
-            }
-            for (; x < chromaWidth; ++x) {
-                out[2 * x] = uint8_t((unsigned(u0[x]) + u1[x] + 1) >> 1);
-                out[2 * x + 1] = uint8_t((unsigned(v0[x]) + v1[x] + 1) >> 1);
+            if (is422) {
+                const uint8_t* u1 = u0 + frame.linesize[1];
+                const uint8_t* v1 = v0 + frame.linesize[2];
+                for (; x + 16 <= chromaWidth; x += 16) {
+                    const __m128i u = _mm_avg_epu8(_mm_loadu_si128(reinterpret_cast<const __m128i*>(u0 + x)), _mm_loadu_si128(reinterpret_cast<const __m128i*>(u1 + x)));
+                    const __m128i v = _mm_avg_epu8(_mm_loadu_si128(reinterpret_cast<const __m128i*>(v0 + x)), _mm_loadu_si128(reinterpret_cast<const __m128i*>(v1 + x)));
+                    pipeline::captureStore128(out + 2 * x, _mm_unpacklo_epi8(u, v), streaming);
+                    pipeline::captureStore128(out + 2 * x + 16, _mm_unpackhi_epi8(u, v), streaming);
+                }
+                for (; x < chromaWidth; ++x) {
+                    out[2 * x] = uint8_t((unsigned(u0[x]) + u1[x] + 1) >> 1);
+                    out[2 * x + 1] = uint8_t((unsigned(v0[x]) + v1[x] + 1) >> 1);
+                }
+            } else {
+                // Native 4:2:0 only changes planar storage into NV12's UVUV
+                // interleave. Do not average a row with itself through the
+                // MJPEG 4:2:2 path.
+                for (; x + 16 <= chromaWidth; x += 16) {
+                    const __m128i u = _mm_loadu_si128(reinterpret_cast<const __m128i*>(u0 + x));
+                    const __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(v0 + x));
+                    pipeline::captureStore128(out + 2 * x, _mm_unpacklo_epi8(u, v), streaming);
+                    pipeline::captureStore128(out + 2 * x + 16, _mm_unpackhi_epi8(u, v), streaming);
+                }
+                for (; x < chromaWidth; ++x) { out[2 * x] = u0[x]; out[2 * x + 1] = v0[x]; }
             }
         }
+        pipeline::finishCaptureStreamingStores(streaming);
         pipeline::sampleCaptureUploadProxy(*target, frame.data[0], size_t(frame.linesize[0]), false);
         return true;
+    }
+
+    // Planar YUV420P10 is the normal software output of 10-bit HEVC/AV1/VP9.
+    // Repack it as P010 by shifting each low-bit 10-bit sample into the high
+    // bits of the 16-bit container. Already-semiplanar P010 is copied as-is.
+    // This is still a pure repacking path: no swscale filtering, range change,
+    // or precision loss is introduced.
+    bool planarToP010(const AVFrame& frame, AVFrame* target)
+    {
+        const unsigned outputWidth = unsigned(target->width), outputHeight = unsigned(target->height);
+        const bool planar10 = frame.format == AV_PIX_FMT_YUV420P10LE;
+        const bool semiplanar10 = frame.format == AV_PIX_FMT_P010;
+        if ((!planar10 && !semiplanar10) || target->format != AV_PIX_FMT_P010 ||
+            frame.width != int(outputWidth) || frame.height != int(outputHeight) ||
+            outputWidth % 2 || outputHeight % 2 || !frame.data[0] || !frame.data[1] || !target->data[0] || !target->data[1] ||
+            target->linesize[0] < int(outputWidth * 2) || target->linesize[1] < int(outputWidth * 2)) return false;
+        const size_t rowBytes = size_t(outputWidth) * 2;
+        const bool streaming = pipeline::captureUploadDirectTarget(*target);
+        if (semiplanar10) {
+            if (target->linesize[0] == frame.linesize[0] && outputHeight > 1)
+                std::memcpy(target->data[0], frame.data[0], size_t(frame.linesize[0]) * (outputHeight - 1) + rowBytes);
+            else for (unsigned y = 0; y < outputHeight; ++y)
+                std::memcpy(target->data[0] + ptrdiff_t(y) * target->linesize[0], frame.data[0] + ptrdiff_t(y) * frame.linesize[0], rowBytes);
+            const unsigned chromaRows = outputHeight / 2;
+            if (target->linesize[1] == frame.linesize[1] && chromaRows > 1)
+                std::memcpy(target->data[1], frame.data[1], size_t(frame.linesize[1]) * (chromaRows - 1) + rowBytes);
+            else for (unsigned y = 0; y < chromaRows; ++y)
+                std::memcpy(target->data[1] + ptrdiff_t(y) * target->linesize[1], frame.data[1] + ptrdiff_t(y) * frame.linesize[1], rowBytes);
+        } else {
+            if (!frame.data[2] || frame.linesize[0] < int(rowBytes) ||
+                frame.linesize[1] < int(rowBytes / 2) || frame.linesize[2] < int(rowBytes / 2)) return false;
+            for (unsigned y = 0; y < outputHeight; ++y) {
+                const auto* in = reinterpret_cast<const uint16_t*>(frame.data[0] + ptrdiff_t(y) * frame.linesize[0]);
+                uint8_t* out = target->data[0] + ptrdiff_t(y) * target->linesize[0];
+                unsigned x = 0;
+                for (; x + 8 <= outputWidth; x += 8) {
+                    const __m128i value = _mm_slli_epi16(_mm_loadu_si128(reinterpret_cast<const __m128i*>(in + x)), 6);
+                    pipeline::captureStore128(out + 2 * x, value, streaming);
+                }
+                for (; x < outputWidth; ++x) {
+                    const uint16_t value = uint16_t(in[x] << 6);
+                    out[2 * x] = uint8_t(value);
+                    out[2 * x + 1] = uint8_t(value >> 8);
+                }
+            }
+            const unsigned chromaWidth = outputWidth / 2;
+            for (unsigned row = 0; row < outputHeight / 2; ++row) {
+                const auto* u0 = reinterpret_cast<const uint16_t*>(frame.data[1] + ptrdiff_t(row) * frame.linesize[1]);
+                const auto* v0 = reinterpret_cast<const uint16_t*>(frame.data[2] + ptrdiff_t(row) * frame.linesize[2]);
+                uint8_t* out = target->data[1] + ptrdiff_t(row) * target->linesize[1];
+                unsigned x = 0;
+                for (; x + 8 <= chromaWidth; x += 8) {
+                    const __m128i u = _mm_slli_epi16(_mm_loadu_si128(reinterpret_cast<const __m128i*>(u0 + x)), 6);
+                    const __m128i v = _mm_slli_epi16(_mm_loadu_si128(reinterpret_cast<const __m128i*>(v0 + x)), 6);
+                    pipeline::captureStore128(out + 4 * x, _mm_unpacklo_epi16(u, v), streaming);
+                    pipeline::captureStore128(out + 4 * x + 16, _mm_unpackhi_epi16(u, v), streaming);
+                }
+                for (; x < chromaWidth; ++x) {
+                    const uint16_t u = uint16_t(u0[x] << 6), v = uint16_t(v0[x] << 6);
+                    out[4 * x] = uint8_t(u);
+                    out[4 * x + 1] = uint8_t(u >> 8);
+                    out[4 * x + 2] = uint8_t(v);
+                    out[4 * x + 3] = uint8_t(v >> 8);
+                }
+            }
+        }
+        pipeline::finishCaptureStreamingStores(streaming);
+        if (planar10) samplePlanar10P010Proxy(*target, frame);
+        else pipeline::sampleCaptureUploadProxy(*target, frame.data[0], size_t(frame.linesize[0]), false);
+        return true;
+    }
+
+    void copyMetadataSideData(const AVFrame& frame, AVFrame* target, AVFrameSideDataType type)
+    {
+        // Targets are pooled and reused. Remove stale metadata first: a frame
+        // whose bitstream drops HDR metadata must not inherit the previous one.
+        while (av_frame_get_side_data(target, type)) av_frame_remove_side_data(target, type);
+        const AVFrameSideData* source = av_frame_get_side_data(&frame, type);
+        if (!source) return;
+        AVFrameSideData* copy = av_frame_new_side_data(target, type, source->size);
+        if (!copy) return;
+        std::memcpy(copy->data, source->data, source->size);
+        av_dict_copy(&copy->metadata, source->metadata, 0);
     }
 
     void copyFrameProperties(const AVFrame& frame, AVFrame* target, bool targetFullRange)
@@ -135,12 +308,25 @@ struct CaptureCompressedDecoder::Impl {
         target->color_primaries = frame.color_primaries;
         target->color_trc = frame.color_trc;
         target->color_range = targetFullRange ? AVCOL_RANGE_JPEG : AVCOL_RANGE_MPEG;
+        target->chroma_location = frame.chroma_location;
+        // Software conversion produces a fresh AVFrame. Preserve the HDR
+        // metadata the pipeline actually consumes; otherwise a compressed HDR
+        // capture loses its mastering peak/MaxCLL whenever it uses the software
+        // fallback even though the hardware path carries those side data through.
+        copyMetadataSideData(frame, target, AV_FRAME_DATA_MASTERING_DISPLAY_METADATA);
+        copyMetadataSideData(frame, target, AV_FRAME_DATA_CONTENT_LIGHT_LEVEL);
+        // JPEG/MJPEG chroma is centred when the bitstream carries no newer
+        // explicit siting tag; H.264/HEVC keep their own MPEG-style default.
+        if (target->chroma_location == AVCHROMA_LOC_UNSPECIFIED && codec == CaptureCodec::Mjpeg)
+            target->chroma_location = AVCHROMA_LOC_CENTER;
     }
 
     void close()
     {
         if (sws) { sws_freeContext(sws); sws = nullptr; }
         if (parameters) { avcodec_parameters_free(&parameters); parameters = nullptr; }
+        if (uploadDevice) { uploadDevice->Release(); uploadDevice = nullptr; }
+        softwareFormat.store(int(AV_PIX_FMT_NONE), std::memory_order_relaxed);
         decoder.close();
         codec = CaptureCodec::None;
         width = height = 0;
@@ -173,47 +359,47 @@ struct CaptureCompressedDecoder::Impl {
     bool openSoftwareDecoder()
     {
         if (parameters == nullptr) return false;
-        // Streams get slice/tile threads; low delay keeps them inside one frame,
-        // so latency does not grow. Software stays a last resort: at 150 Mbps
-        // one frame still takes 25-45 ms here (bench 2026-10-01), so the stream
-        // sources prefer every hardware path above.
-        const unsigned threads = stream && codec != CaptureCodec::Mjpeg
+        // Slice/tile threading is safe for live capture because low-delay mode
+        // explicitly disables frame threading: work is parallel inside the same
+        // picture, so no extra frame of output latency is introduced. This was
+        // previously limited to streaming sources, but capture-card software
+        // fallback needs the same throughput when hardware decode is absent or
+        // rejects a codec. MJPEG stays single-threaded per decoder because the
+        // capture source already runs multiple independent MJPEG decoders.
+        const unsigned threads = codec != CaptureCodec::Mjpeg
             ? std::clamp(std::thread::hardware_concurrency() / 2u, 2u, 8u) : 1u;
         return decoder.openSoftware(parameters, 1, 10000000, threads, true);
     }
 
-    bool convertToNv12(const AVFrame& frame, AVFrame* target)
+    bool convertSoftware(const AVFrame& frame, AVFrame* target)
     {
         AVPixelFormat sourceFormat = AVPixelFormat(frame.format);
         if (sourceFormat == AV_PIX_FMT_YUVJ422P) sourceFormat = AV_PIX_FMT_YUV422P;
         else if (sourceFormat == AV_PIX_FMT_YUVJ420P) sourceFormat = AV_PIX_FMT_YUV420P;
         else if (sourceFormat == AV_PIX_FMT_YUVJ444P) sourceFormat = AV_PIX_FMT_YUV444P;
+        const AVPixelFormat outputFormat = AVPixelFormat(target->format);
         if (const auto* description = av_pix_fmt_desc_get(sourceFormat)) {
-            if (description->comp[0].depth > 8 && !depthWarningLogged) {
+            if (description->comp[0].depth > 10 && !depthWarningLogged) {
                 depthWarningLogged = true;
                 log::warn("capture-decode", std::format(
-                    "codec={} bitstream is {}-bit; converting to 8-bit NV12 because the capture ingress contract is 8-bit SDR (a P010/HDR capture contract is not implemented)",
+                    "codec={} bitstream is {}-bit; converting to the 10-bit P010 capture contract",
                     captureCodecKey(codec), description->comp[0].depth));
             }
         }
-        const bool native=stream&&nativeSoftwareExtent;
-        const int outputWidth=native?frame.width:int(width),outputHeight=native?frame.height:int(height);
-        if(outputWidth<=0||outputHeight<=0||outputWidth>D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION||
-           outputHeight>D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION){
-            error="invalid decoded video extent";++failures;return false;
+        if ((outputFormat == AV_PIX_FMT_NV12 && planarToNv12(frame, target)) ||
+            (outputFormat == AV_PIX_FMT_P010 && planarToP010(frame, target))) {
+            // Repacking never changes code values. Preserve explicit full range
+            // instead of quantizing it to limited; use limited only as the
+            // ordinary compressed-video fallback when the bitstream is silent.
+            const bool fullRange = codec == CaptureCodec::Mjpeg || frame.color_range == AVCOL_RANGE_JPEG ||
+                frame.format == AV_PIX_FMT_YUVJ420P || frame.format == AV_PIX_FMT_YUVJ422P;
+            copyFrameProperties(frame, target, fullRange);
+            return true;
         }
-        if(target->width!=outputWidth||target->height!=outputHeight||
-           target->format!=AV_PIX_FMT_NV12||!target->data[0]||!target->data[1]){
-            if(!native){error="fixed capture target extent or buffer does not match";++failures;return false;}
-            av_frame_unref(target);
-            target->format=AV_PIX_FMT_NV12;target->width=outputWidth;target->height=outputHeight;
-            if(av_frame_get_buffer(target,32)<0){error="native-size stream output allocation failed";++failures;return false;}
-        }
-        if (planarToNv12(frame, target)) { copyFrameProperties(frame, target, true); return true; }
         // swscale cannot supply the analysis pixels of an upload-backed target.
         pipeline::useCaptureUploadCpuPlanes(*target);
         sws = sws_getCachedContext(sws, frame.width, frame.height, sourceFormat,
-            outputWidth, outputHeight, AV_PIX_FMT_NV12, SWS_BILINEAR, nullptr, nullptr, nullptr);
+            target->width, target->height, outputFormat, SWS_BILINEAR, nullptr, nullptr, nullptr);
         if (sws == nullptr) {
             error = "swscale context creation failed";
             ++failures;
@@ -222,8 +408,9 @@ struct CaptureCompressedDecoder::Impl {
         const int* coefficients = sws_getCoefficients(swsColorspaceOf(frame.colorspace, unsigned(frame.height)));
         // MJPEG samples are full-range JPEG planes and the declared ingress
         // contract for that path is full-range NV12. Compressed video keeps
-        // the bitstream's own range and lands on the standard limited NV12.
-        const int sourceFullRange = (codec == CaptureCodec::Mjpeg || frame.color_range == AVCOL_RANGE_JPEG) ? 1 : 0;
+        // the bitstream's own range and lands on the standard limited target.
+        const bool jpegCoded = frame.format == AV_PIX_FMT_YUVJ420P || frame.format == AV_PIX_FMT_YUVJ422P || frame.format == AV_PIX_FMT_YUVJ444P;
+        const int sourceFullRange = (codec == CaptureCodec::Mjpeg || frame.color_range == AVCOL_RANGE_JPEG || jpegCoded) ? 1 : 0;
         const int targetFullRange = codec == CaptureCodec::Mjpeg ? 1 : 0;
         sws_setColorspaceDetails(sws, coefficients, sourceFullRange, coefficients, targetFullRange, 0, 1 << 16, 1 << 16);
         uint8_t* destination[4] = { target->data[0], target->data[1], nullptr, nullptr };
@@ -250,6 +437,12 @@ bool CaptureCompressedDecoder::open(CaptureCodec codec, unsigned width, unsigned
     p.codec = codec;
     p.width = width;
     p.height = height;
+    // Software frames are written straight into the same upload-backed target
+    // contract as capture. Keep one reference even when hardware open fails;
+    // the decoder and device are both owned by the capture source and close in
+    // reverse order.
+    p.uploadDevice = device;
+    if (p.uploadDevice) p.uploadDevice->AddRef();
     p.parameters = avcodec_parameters_alloc();
     if (p.parameters == nullptr) {
         p.error = "avcodec_parameters_alloc failed";
@@ -306,13 +499,31 @@ bool CaptureCompressedDecoder::open(CaptureCodec codec, unsigned width, unsigned
 bool CaptureCompressedDecoder::decode(const uint8_t* data, size_t bytes, int64_t pts100ns,
     AVFrame* nv12Target, AVFrame** out, bool& hardware)
 {
+    if (data == nullptr && bytes == 0) return decodeOwned(nullptr, pts100ns, nv12Target, out, hardware);
+    if (data == nullptr || bytes == 0) {
+        *out = nullptr;
+        hardware = false;
+        p_->error = "decode called without compressed payload bytes";
+        ++p_->failures;
+        return false;
+    }
+    // Compatibility path for streaming sources. CaptureCardSource uses
+    // decodeOwned() with its recycled payload allocation instead.
+    auto payload = std::make_shared<CompressedPayload>();
+    payload->assign(data, bytes);
+    return decodeOwned(std::move(payload), pts100ns, nv12Target, out, hardware);
+}
+
+bool CaptureCompressedDecoder::decodeOwned(const CompressedPayloadPtr& payload, int64_t pts100ns,
+    AVFrame* nv12Target, AVFrame** out, bool& hardware)
+{
     auto& p = *p_;
     *out = nullptr;
     hardware = false;
     p.waiting = false;
-    const bool receiveOnly = data == nullptr && bytes == 0;
-    if (!p.decoder.opened() || (!receiveOnly && (data == nullptr || bytes == 0)) || nv12Target == nullptr) {
-        p.error = "decode called without an open decoder or a writable target frame";
+    const bool receiveOnly = payload == nullptr;
+    if (!p.decoder.opened() || (!receiveOnly && (payload->size == 0 || payload->size > size_t(INT_MAX)))) {
+        p.error = "decode called without an open decoder or a valid payload";
         ++p.failures;
         return false;
     }
@@ -332,13 +543,26 @@ bool CaptureCompressedDecoder::decode(const uint8_t* data, size_t bytes, int64_t
                 ++p.failures;
                 return false;
             }
-            if (av_new_packet(packet, int(bytes)) < 0) {
+            // avcodec_send_packet() references rather than copies packet
+            // buffers. Hand it one refcounted view of the capture payload
+            // instead of paying for a second full MJPEG/H.264 copy in
+            // av_new_packet().
+            // The shared_ptr holder is released by FFmpeg's AVBuffer callback,
+            // so decoder reference frames may retain the packet safely even if
+            // the worker has already moved on.
+            auto* holder = new CompressedPayloadPtr(payload);
+            AVBufferRef* buffer = av_buffer_create(const_cast<uint8_t*>(payload->data()), int(payload->size),
+                releaseCompressedPayload, holder, AV_BUFFER_FLAG_READONLY);
+            if (buffer == nullptr) {
+                delete holder;
                 av_packet_free(&packet);
-                p.error = "av_new_packet failed";
+                p.error = "compressed payload buffer reference failed";
                 ++p.failures;
                 return false;
             }
-            std::memcpy(packet->data, data, bytes);
+            packet->buf = buffer;
+            packet->data = buffer->data;
+            packet->size = int(buffer->size);
             packet->pts = pts100ns;
             packet->dts = AV_NOPTS_VALUE; // capture PTS is not decode order for B frames
             const bool sent = p.decoder.sendPacket(packet);
@@ -398,10 +622,48 @@ bool CaptureCompressedDecoder::decode(const uint8_t* data, size_t bytes, int64_t
             return true;
         }
         const auto decoded = std::chrono::steady_clock::now();
-        if (!p.convertToNv12(*frame, nv12Target)) return false;
+        const AVPixelFormat desiredFormat = p.softwareOutputFormat(*frame);
+        p.softwareFormat.store(int(desiredFormat), std::memory_order_relaxed);
+        const bool native = p.stream && p.nativeSoftwareExtent;
+        const int outputWidth = native ? frame->width : int(p.width);
+        const int outputHeight = native ? frame->height : int(p.height);
+        if (outputWidth <= 0 || outputHeight <= 0 || outputWidth > D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION ||
+            outputHeight > D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION) {
+            p.error = "invalid decoded video extent";
+            ++p.failures;
+            return false;
+        }
+        AVFrame* target = nv12Target;
+        const bool sameFormat = target && target->format == int(desiredFormat);
+        const bool compatible = sameFormat && target->width == outputWidth && target->height == outputHeight &&
+            target->data[0] && target->data[1];
+        if (!compatible) {
+            AVFrame* replacement = p.allocateSoftwareTarget(desiredFormat, outputWidth, outputHeight);
+            if (replacement && native && sameFormat) {
+                // The stream caller reuses this AVFrame while the negotiated picture size changes.
+                av_frame_unref(target);
+                av_frame_move_ref(target, replacement);
+                av_frame_free(&replacement);
+            } else {
+                target = replacement;
+            }
+        }
+        if (target == nullptr) {
+            p.error = "software output target allocation failed";
+            ++p.failures;
+            return false;
+        }
+        // Internally allocated upload frames start with direct=false until the
+        // target is selected. This is also harmless for the worker-supplied
+        // target, which has already made the same selection.
+        pipeline::selectCaptureUploadTarget(*target);
+        if (!p.convertSoftware(*frame, target)) {
+            if (target != nv12Target) av_frame_free(&target);
+            return false;
+        }
         average(p.decodeMs, started, decoded);
         average(p.convertMs, decoded, std::chrono::steady_clock::now());
-        *out = nv12Target;
+        *out = target;
         hardware = false;
         ++p.frames;
         p.error.clear();
@@ -417,6 +679,7 @@ void CaptureCompressedDecoder::preserveSoftwareStreamExtent(bool enabled) { p_->
 bool CaptureCompressedDecoder::opened() const { return p_->decoder.opened(); }
 bool CaptureCompressedDecoder::hardwareActive() const { return p_->hardware; }
 bool CaptureCompressedDecoder::waitingForInput() const { return p_->waiting; }
+int CaptureCompressedDecoder::softwareTargetFormat() const { return p_->softwareFormat.load(std::memory_order_relaxed); }
 void CaptureCompressedDecoder::recoverAtKeyframe() { p_->decoder.recoverAtKeyframe(); }
 const char* CaptureCompressedDecoder::backendName() const
 {

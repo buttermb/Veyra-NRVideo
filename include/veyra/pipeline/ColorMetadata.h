@@ -85,6 +85,22 @@ inline ColorDescription resolveFrameColor(const AVFrame& frame,ColorDescription 
     if(c.transfer==TransferFunction::Unknown){c.transfer=rgb?TransferFunction::SRGB:TransferFunction::BT709;c.transferAssumed=true;}
     return c;
 }
+// Live capture carries chroma-subsampled pixels most of the time. Opt those
+// formats into the reconstruction filter; RGB ingress keeps the legacy direct
+// path. Unknown siting is resolved by the shader's documented MPEG-left default.
+inline bool subsampledCaptureChroma(SourcePixelFormat format)
+{
+    switch(format){
+    case SourcePixelFormat::NV12:case SourcePixelFormat::P010:case SourcePixelFormat::P016:
+    case SourcePixelFormat::Yuv420P:case SourcePixelFormat::Yuy2:case SourcePixelFormat::Uyvy:
+    case SourcePixelFormat::Yvyu:case SourcePixelFormat::V210:return true;
+    default:return false;
+    }
+}
+inline void enableCaptureChromaReconstruction(ColorDescription& color)
+{
+    if(subsampledCaptureChroma(color.pixelFormat))color.reconstructChroma=true;
+}
 // BT.2020 10/12-bit SDR uses the BT.709-compatible OETF. Keep it distinct in
 // metadata, but feed the same shader transfer branch rather than sRGB.
 inline uint32_t transferCode(TransferFunction t){return t==TransferFunction::Linear?0u:(t==TransferFunction::BT709||t==TransferFunction::BT2020_10)?2u:1u;}

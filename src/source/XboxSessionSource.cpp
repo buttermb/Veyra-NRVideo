@@ -554,7 +554,12 @@ void XboxSessionSource::decodeLoop() {
             if (cloned) frame.reset(cloned, [](AVFrame* f) { av_frame_free(&f); });
             if (needsTarget && target) av_frame_free(&target);
         } else {
-            frame.reset(target, [](AVFrame* f) { av_frame_free(&f); });
+            // Software output is normally the caller-supplied target, but a
+            // deep-bitstream picture may need a newly allocated P010 frame.
+            // Ownership of `out` transfers here; an incompatible supplied
+            // target remains unused and is freed separately.
+            if (out != target && needsTarget && target) av_frame_free(&target);
+            frame.reset(out, [](AVFrame* f) { av_frame_free(&f); });
         }
         if (!frame) { ++p.errors; continue; }
         recovery.picture();

@@ -400,7 +400,12 @@ struct MoonlightSessionSource::Callbacks {
                 if (cloned) frame.reset(cloned, [](AVFrame* f) { av_frame_free(&f); });
                 if (needsTarget && target) av_frame_free(&target);
             } else {
-                frame.reset(target, [](AVFrame* f) { av_frame_free(&f); });   // the picture was converted into it
+                // Software output is normally the supplied target, but a
+                // deep-bitstream picture may be a newly allocated P010 frame.
+                // Ownership of `out` transfers here; free only the unused
+                // incompatible target, never the shared hardware dummy target.
+                if (out != target && needsTarget && target) av_frame_free(&target);
+                frame.reset(out, [](AVFrame* f) { av_frame_free(&f); });
             }
             if (!frame) { ++p.errors; LiCompleteVideoFrame(handle, DR_OK); continue; }
             seenIdr = true;

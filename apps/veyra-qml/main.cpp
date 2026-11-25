@@ -504,10 +504,41 @@ LONG WINAPI crashFilter(EXCEPTION_POINTERS* info) {
     veyra::log::error("crash", std::format("unhandled exception code=0x{:08X} address=0x{:X} module={} offset=0x{:X} thread={}",
         code, address, std::filesystem::path(moduleName).filename().string(),
         module ? address - reinterpret_cast<uintptr_t>(module) : uintptr_t(0), GetCurrentThreadId()));
+    bool loggedFaultStack = false;
+    if (info && info->ContextRecord) {
+        HANDLE process = GetCurrentProcess();
+        HANDLE thread = GetCurrentThread();
+        SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS);
+        const BOOL symbols = SymInitialize(process, nullptr, TRUE);
+        CONTEXT context = *info->ContextRecord;
+        STACKFRAME64 frame{};
+        frame.AddrPC.Offset = context.Rip;
+        frame.AddrPC.Mode = AddrModeFlat;
+        frame.AddrFrame.Offset = context.Rbp;
+        frame.AddrFrame.Mode = AddrModeFlat;
+        frame.AddrStack.Offset = context.Rsp;
+        frame.AddrStack.Mode = AddrModeFlat;
+        for (unsigned i = 0; i < 64; ++i) {
+            if (!StackWalk64(IMAGE_FILE_MACHINE_AMD64, process, thread, &frame, &context, nullptr,
+                             SymFunctionTableAccess64, SymGetModuleBase64, nullptr) || frame.AddrPC.Offset == 0)
+                break;
+            loggedFaultStack = true;
+            const auto frameAddress = static_cast<uintptr_t>(frame.AddrPC.Offset);
+            HMODULE frameModule = nullptr;
+            wchar_t frameModuleName[MAX_PATH]{};
+            if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                   reinterpret_cast<LPCWSTR>(frameAddress), &frameModule) && frameModule)
+                GetModuleFileNameW(frameModule, frameModuleName, MAX_PATH);
+            veyra::log::error("crash", std::format("stack[{:02}] {}+0x{:X}", i,
+                frameModule ? std::filesystem::path(frameModuleName).filename().string() : std::string("unknown"),
+                frameModule ? frameAddress - reinterpret_cast<uintptr_t>(frameModule) : frameAddress));
+        }
+        if (symbols) SymCleanup(process);
+    }
     // The file offset alone only names the faulting instruction. A return-address
     // list, printed as module-relative offsets, names the callers too, so a field
     // crash can be attributed without a debugger attached.
-    {
+    if (!loggedFaultStack) {
         void* frames[32]{};
         const USHORT count = CaptureStackBackTrace(0, 32, frames, nullptr);
         std::string trace;

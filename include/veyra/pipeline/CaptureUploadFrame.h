@@ -167,6 +167,24 @@ inline void useCaptureUploadCpuPlanes(AVFrame& frame) {
     if (info->planes == 2) frame.data[1] = info->cpu + info->chromaOffset;
 }
 
+// True while the caller is writing the actual upload buffer rather than its
+// CPU fallback planes. SIMD writers can then use non-temporal stores: the
+// pixels are consumed by the GPU copy engine, not by a CPU reader, so keeping
+// them in CPU cache only evicts other capture state.
+inline bool captureUploadDirectTarget(const AVFrame& frame) {
+    const auto* info = captureUploadFrame(&frame);
+    return info && info->direct && frame.data[0] == info->mapped;
+}
+
+inline void captureStore128(uint8_t* destination, __m128i value, bool streaming) {
+    if (streaming) _mm_stream_si128(reinterpret_cast<__m128i*>(destination), value);
+    else _mm_storeu_si128(reinterpret_cast<__m128i*>(destination), value);
+}
+
+inline void finishCaptureStreamingStores(bool streaming) {
+    if (streaming) _mm_sfence();
+}
+
 // Capture callback, after the copy: the pixels the graph analyses, read from
 // plane 0 of the driver sample. flip: destination row r came from source row
 // height-1-r.
@@ -240,8 +258,11 @@ inline void sampleCaptureV210Proxy(AVFrame& frame,const uint8_t* source,size_t p
 // first source row of each chroma plane; flip reverses the rows of every plane.
 inline void interleaveCaptureI420(AVFrame& dst, const uint8_t* luma, size_t lumaPitch, const uint8_t* u, const uint8_t* v, size_t chromaPitch,
                                   unsigned width, unsigned height, bool flip) {
-    for (unsigned row = 0; row < height; ++row)
+    if (!flip && dst.linesize[0] == int(lumaPitch) && height > 1)
+        std::memcpy(dst.data[0], luma, size_t(lumaPitch) * (height - 1) + width);
+    else for (unsigned row = 0; row < height; ++row)
         std::memcpy(dst.data[0] + ptrdiff_t(flip ? height - 1 - row : row) * dst.linesize[0], luma + size_t(row) * lumaPitch, width);
+    const bool streaming = captureUploadDirectTarget(dst);
     const unsigned chromaRows = height / 2, chromaWidth = width / 2;
     for (unsigned row = 0; row < chromaRows; ++row) {
         uint8_t* out = dst.data[1] + ptrdiff_t(flip ? chromaRows - 1 - row : row) * dst.linesize[1];
@@ -249,11 +270,12 @@ inline void interleaveCaptureI420(AVFrame& dst, const uint8_t* luma, size_t luma
         unsigned x = 0;
         for (; x + 16 <= chromaWidth; x += 16) {
             const __m128i uu = _mm_loadu_si128(reinterpret_cast<const __m128i*>(a + x)), vv = _mm_loadu_si128(reinterpret_cast<const __m128i*>(b + x));
-            _mm_storeu_si128(reinterpret_cast<__m128i*>(out + 2 * x), _mm_unpacklo_epi8(uu, vv));
-            _mm_storeu_si128(reinterpret_cast<__m128i*>(out + 2 * x + 16), _mm_unpackhi_epi8(uu, vv));
+            captureStore128(out + 2 * x, _mm_unpacklo_epi8(uu, vv), streaming);
+            captureStore128(out + 2 * x + 16, _mm_unpackhi_epi8(uu, vv), streaming);
         }
         for (; x < chromaWidth; ++x) { out[2 * x] = a[x]; out[2 * x + 1] = b[x]; }
     }
+    finishCaptureStreamingStores(streaming);
 }
 
 } // namespace veyra::pipeline

@@ -4,10 +4,11 @@
 #include "ColorGrade.hlsli"
 cbuffer Params : register(b0) {
     uint width; uint height; uint transfer; uint reserved;
-    float limited; float matrix709; float primaries2020; float padding;
+    float limited; float matrix709; float primaries2020; float chromaModeBits;
     float4 colorRow0; float4 colorRow1; float4 colorRow2; float4 colorControls; float4 colorFlags;
 };
 Texture2D<float4> packedYuy2 : register(t0);
+SamplerState packedLinearClamp : register(s1);
 RWTexture2D<float4> linearRgb : register(u0);
 float decode(float v) {
     if(transfer==0)return v;
@@ -15,21 +16,32 @@ float decode(float v) {
     if(transfer==2)return v<0.081?v/4.5:pow((v+0.099)/1.099,1.0/0.45);
     return v<=0.04045?v/12.92:pow((v+0.055)/1.055,2.4);
 }
+float2 pairChroma(uint pairX, uint y) { return packedYuy2[uint2(pairX, y)].yw; }
+
+// Native 4:2:2 chroma is horizontally subsampled. The legacy path reused one
+// chroma pair for both luma pixels, which is nearest-neighbour chroma and
+// leaves colour steps on capture-card edges. Reconstruct the missing sample
+// positions linearly; unknown siting uses the MPEG/HD-video left convention.
+float2 reconstructChroma422(uint x, uint y)
+{
+    const uint mode=uint(chromaModeBits);
+    const uint pairX=x/2;
+    if(mode==0)return pairChroma(pairX,y);
+    const float horizontalOrigin=(mode==2||mode==4||mode==6)?0.5:0.0;
+    const float position=(float(x)-horizontalOrigin)*0.5;
+    // Chroma occupies the same byte lanes in every packed pair texel, so the
+    // texture unit's linear filter interpolates exactly the two chroma taps;
+    // the luma lanes it also filters are simply discarded.
+    const float chromaWidth=float((width+1)/2);
+    return packedYuy2.SampleLevel(packedLinearClamp,float2((position+0.5)/chromaWidth,(float(y)+0.5)/float(height)),0).yw;
+}
+
 [numthreads(16,16,1)]
 void main(uint3 p : SV_DispatchThreadID) {
     if(p.x>=width||p.y>=height)return;
     const float4 pair=packedYuy2[uint2(p.x/2,p.y)];
     float y=(p.x&1)?pair.z:pair.x;
-    // 4:2:2 chroma is co-sited with the even luma sample (BT.601/709, MPEG-2
-    // siting). The odd pixel lies halfway to the next pair's chroma, so it gets
-    // their average instead of a copy of its own pair's sample. Copying it made
-    // every coloured edge a two-pixel step, which reads as blocky small text
-    // and HUD detail at 1:1. OBS reconstructs the same way: a bilinear chroma
-    // fetch at the left-sited position (libobs format_conversion.effect,
-    // PSYUY2_Reverse with VSPacked422Left_Reverse).
-    float2 cbcr=pair.yw;
-    if(p.x&1)cbcr=0.5*(cbcr+packedYuy2[uint2(min(p.x/2+1,width/2-1),p.y)].yw);
-    float2 uv=cbcr-128.0/255.0;
+    float2 uv=reconstructChroma422(p.x,p.y)-128.0/255.0;
     if(limited>0.5){y=(y-16.0/255.0)*(255.0/219.0);uv*=255.0/224.0;}
     // Preserve head/footroom until the final RGB gamut clamp. Clipping Y
     // before the matrix changes saturated pixels with below-black luma.

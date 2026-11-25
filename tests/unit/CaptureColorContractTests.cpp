@@ -39,6 +39,16 @@ int main(){
     CoInitializeEx(nullptr,COINIT_MULTITHREADED);int failures=0;
     auto check=[&](bool pass,const char* name){std::cout<<(pass?"PASS ":"FAIL ")<<name<<'\n';if(!pass)++failures;};
     captureFormatCases(check);
+    {
+        pipeline::ColorDescription color{};
+        color.pixelFormat=pipeline::SourcePixelFormat::NV12;
+        pipeline::enableCaptureChromaReconstruction(color);
+        check(color.reconstructChroma,"NV12 capture opts into chroma reconstruction");
+        color=pipeline::ColorDescription{};
+        color.pixelFormat=pipeline::SourcePixelFormat::Bgra8;
+        pipeline::enableCaptureChromaReconstruction(color);
+        check(!color.reconstructChroma,"RGB capture keeps the direct non-subsampled path");
+    }
     blackmagicTest::run(check);
     elgatoHdrCases(check);
     bmdAllocatorCases(check);
