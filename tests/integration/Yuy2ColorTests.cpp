@@ -183,6 +183,46 @@ bool reconstructedCaptureChroma(gfx::D3D12DeviceContext& ctx,gfx::CommandSlotRin
     }
     return all;
 }
+bool v210CaptureChroma(gfx::D3D12DeviceContext& ctx,gfx::CommandSlotRing& ring) {
+    using namespace pipeline;
+    constexpr unsigned w=36,h=8;
+    AVFrame* frame=av_frame_alloc();
+    if(!frame)return false;
+    frame->format=AV_PIX_FMT_BGRA;frame->width=w;frame->height=h;
+    if(av_frame_get_buffer(frame,32)<0){av_frame_free(&frame);return false;}
+    for(unsigned y=0;y<h;++y){
+        auto* row=frame->data[0]+ptrdiff_t(y)*frame->linesize[0];
+        for(unsigned x=0;x<w;x+=6){
+            unsigned yy[6],u[3],v[3];
+            for(unsigned i=0;i<6;++i)yy[i]=512;
+            for(unsigned i=0;i<3;++i){
+                const bool alternate=((x/2+i)&1)!=0;
+                u[i]=alternate?768:256;v[i]=alternate?256:768;
+            }
+            const uint32_t words[]={u[0]|yy[0]<<10|v[0]<<20,yy[1]|u[1]<<10|yy[2]<<20,
+                v[1]|yy[3]<<10|u[2]<<20,yy[4]|v[2]<<10|yy[5]<<20};
+            std::memcpy(row+(x/6)*16,words,sizeof(words));
+        }
+    }
+    ColorDescription color;color.pixelFormat=SourcePixelFormat::V210;color.range=ColorRange::Full;
+    color.matrix=YuvMatrix::BT709;color.transfer=TransferFunction::SRGB;color.chromaLocation=ChromaLocation::Left;
+    enableCaptureChromaReconstruction(color);
+    EnhanceGraphDesc desc;desc.sourceWidth=desc.workWidth=w;desc.sourceHeight=desc.workHeight=h;desc.noFeatures=true;
+    desc.packedInput=6;desc.captureBitDepth=10;
+    EnhanceGraph graph(ctx,ring);EnhanceGraph::FrameOutputs out;std::vector<float> pixels;
+    const bool rendered=graph.initialize(desc)&&graph.createViews()&&graph.process(frame,0,true,out,1,&color)&&
+        captureReadFp16(ctx,ring,graph.diagnosticLinearInput(),pixels);
+    double worstSpread=0;
+    if(rendered)for(unsigned y=0;y<h;++y)for(unsigned x=1;x+1<w;x+=2){
+        const auto* px=pixels.data()+(size_t(y)*w+x)*4;
+        const double low=std::min(px[0],std::min(px[1],px[2])),high=std::max(px[0],std::max(px[1],px[2]));
+        worstSpread=std::max(worstSpread,high-low);
+    }
+    const bool pass=rendered&&worstSpread<0.01;
+    std::cout<<"CAPTURE_CHROMA V210 interiorOddSpread="<<worstSpread<<" pass="<<pass<<std::endl;
+    out={};graph.shutdown();av_frame_free(&frame);
+    return pass;
+}
 bool hdrCaptureChroma(gfx::D3D12DeviceContext& ctx,gfx::CommandSlotRing& ring) {
     using namespace pipeline;
     constexpr unsigned w=256,h=128;
@@ -329,6 +369,8 @@ int wmain(int argc,wchar_t**argv){
         return reconstructedCaptureChroma(ctx,ring)?0:1;
     if(argc==2&&std::wstring_view(argv[1])==L"--capture-hdr-chroma")
         return hdrCaptureChroma(ctx,ring)?0:1;
+    if(argc==2&&std::wstring_view(argv[1])==L"--capture-v210-chroma")
+        return v210CaptureChroma(ctx,ring)?0:1;
     if(argc==2&&std::wstring_view(argv[1])==L"--fullscreen-stats")
         return fullscreenFrameStats(ctx,ring)?0:1;
     if(argc==3&&std::wstring_view(argv[1])==L"--mjpeg-range")
