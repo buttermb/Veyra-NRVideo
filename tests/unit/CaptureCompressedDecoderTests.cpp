@@ -586,6 +586,40 @@ bool unsupportedHardwareExtentFallbackTest(const ElementaryStream& stream, gfx::
 
 } // namespace
 
+// Full-range compressed video must stay full range when the fallback has to
+// resize through swscale. The direct repack path never exercises the swscale
+// range contract, so this test deliberately opens a half-size target.
+bool fullRangeScalingTest(const ElementaryStream& stream)
+{
+    const unsigned width = unsigned(std::max(2, (stream.width / 2) & ~1));
+    const unsigned height = unsigned(std::max(2, (stream.height / 2) & ~1));
+    if (!width || !height || width == unsigned(stream.width) || height == unsigned(stream.height)) return false;
+    source::CaptureCompressedDecoder decoder;
+    if (!decoder.open(stream.codec, width, height, nullptr, 0, nullptr, nullptr)) return false;
+    AVFrame* target = av_frame_alloc();
+    if (!target) return false;
+    target->format = AV_PIX_FMT_NV12;
+    target->width = int(width);
+    target->height = int(height);
+    bool ok = av_frame_get_buffer(target, 32) >= 0;
+    bool produced = false;
+    for (size_t i = 0; ok && i < stream.accessUnits.size() && !produced; ++i) {
+        AVFrame* out = nullptr;
+        bool hardware = false;
+        const auto& unit = stream.accessUnits[i];
+        if (!decoder.decode(unit.data(), unit.size(), stream.pts[i], target, &out, hardware)) {
+            ok = decoder.waitingForInput();
+            continue;
+        }
+        produced = true;
+        ok = !hardware && out == target && out->format == AV_PIX_FMT_NV12 && out->color_range == AVCOL_RANGE_JPEG;
+    }
+    std::cout << (ok && produced ? "PASS " : "FAIL ") << "full-range compressed input remains full range through swscale range="
+        << (target ? int(target->color_range) : -1) << "\n";
+    av_frame_free(&target);
+    return ok && produced;
+}
+
 // Xbox may advertise one size while the SPS describes another. The software
 // fallback scales into the advertised target, so sws_scale returns target rows.
 // Comparing those rows with the decoded source height rejects every good frame.
@@ -696,6 +730,13 @@ int wmain(int argc, wchar_t** argv)
         const std::string smallStorage(utf8Small.begin(),utf8Small.end());
         check(loadAnnexB(smallStorage.c_str(),smallStream,smallError)&&unsupportedHardwareExtentFallbackTest(smallStream,context),
             "unsupported hardware extent falls back to software without losing deep input");
+    }
+    if(argc>4){
+        ElementaryStream fullRange;std::string fullRangeError;
+        const auto utf8FullRange=std::filesystem::path(argv[4]).u8string();
+        const std::string fullRangeStorage(utf8FullRange.begin(),utf8FullRange.end());
+        check(loadAnnexB(fullRangeStorage.c_str(),fullRange,fullRangeError)&&fullRangeScalingTest(fullRange),
+            "full-range compressed input remains full range through swscale");
     }
     // B-frame reordering may emit a slightly different count on the software
     // path; the hardware and software backends must stay within one frame.
