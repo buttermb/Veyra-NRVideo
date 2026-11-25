@@ -1125,7 +1125,16 @@ Window {
         veyra.logUi("ui-music", "stopped for this launch (button)")
     }
     readonly property bool sourceOpen: veyra.hasSource
-    onSourceOpenChanged: if (sourceOpen && typeof vyMusic !== "undefined") vyMusic.pause()
+    property bool startFullscreen: typeof vyStartFullscreen !== "undefined" && vyStartFullscreen
+    onSourceOpenChanged: {
+        if (!sourceOpen) return
+        if (typeof vyMusic !== "undefined") vyMusic.pause()
+        if (!startFullscreen) return
+        startFullscreen = false
+        Qt.callLater(function() {
+            if (root.sourceOpen && !root.fullscreen) root.toggleFullscreen()
+        })
+    }
     // Bottom right of the home page, above the intro too, while the music plays.
     Rectangle {
         id: musicButton

@@ -107,6 +107,7 @@ struct EnhanceGraphDesc {
     bool noFeatures = false;     // VEYRA_NO_FEATURES: NVOF/NGX objects skipped
     bool noNgx = false;          // VEYRA_NO_NGX: core/features skipped, NVOF only
     bool hdrInput = false;       // PQ/HLG YUV ingress; SDR tone mapping unless hdrOutput.
+    bool captureShadowDenoise = false; // Opt-in spatial cleanup at 8-bit SDR capture ingress.
     unsigned captureBitDepth = 8; // SDR P010/P016 storage, independent of HDR transfer.
     bool wideYuvInput() const { return hdrInput || captureBitDepth > 8; }
     bool hdrOutput = false;      // HDR-preserving output; HDR10 by default, FG requires HDR10.

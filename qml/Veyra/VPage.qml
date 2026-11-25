@@ -15,13 +15,16 @@ Item {
     // redrew the whole window for each change (~11 times a second during capture), which
     // cost GPU time and kept OBS game capture on the UI instead of the video.
     property Item home: null
-    parent: (current || leaving) ? home : null
+    // A fullscreen video hides the entire page stack. Live meters on an
+    // attached page can still schedule Qt frames behind the native video.
+    readonly property bool onStage: home !== null && home.visible && (current || leaving)
+    parent: onStage ? home : null
     readonly property var shell: home ? home.Window.window : null
     readonly property bool current: shell !== null && shell.shownPage === pageId
     readonly property bool leaving: shell !== null && shell.leavingPage === pageId
     width: home ? home.width : 0
     height: home ? home.height : 0
-    visible: current || leaving
+    visible: onStage
     // Title-bar behaviour on the page's top strip (field request 2026-10-01: only the
     // dock capsule moved the window). Below the page's own items, so buttons and fields
     // there keep their clicks; empty space drags, a double click maximizes. Pages whose

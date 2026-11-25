@@ -1,5 +1,6 @@
 #pragma once
 #include "veyra/pipeline/ColorMetadata.h"
+#include "veyra/source/CaptureFrameRate.h"
 #include "veyra/source/CapturePixelFormat.h"
 #include <windows.h>
 #include <dshow.h>
@@ -23,6 +24,57 @@ struct CaptureMediaLayout {
     unsigned planes=1,chromaStride=0,chromaRowBytes=0;
     size_t chromaOffset=0,secondChromaOffset=0;
 };
+
+// The untagged DX20R 1440p60 NV12 pin's colour edges align with the lower
+// row and horizontal centre of a 2x2 luma cell in measured capture frames.
+inline bool configureDx20rChroma(CaptureMediaLayout& layout, std::wstring_view name, std::wstring_view devicePath) {
+    if (name != L"DX20R Video Device" || layout.packing != CapturePacking::Nv12 ||
+        layout.format != AV_PIX_FMT_NV12 || layout.width != 2560 || layout.height != 1440 ||
+        !captureFrameRateMatches(60.0, layout.duration) || layout.color.isHdrPath() ||
+        layout.color.matrix != pipeline::YuvMatrix::BT709 || layout.color.range != pipeline::ColorRange::Limited) return false;
+    constexpr std::wstring_view hardwareId = L"vid_2d42&pid_0001&";
+    if (devicePath.empty() || FindStringOrdinal(FIND_FROMSTART, devicePath.data(), int(devicePath.size()),
+                                                hardwareId.data(), int(hardwareId.size()), TRUE) < 0) return false;
+    auto& color = layout.color;
+    if (color.chromaLocation == pipeline::ChromaLocation::Unknown)
+        color.chromaLocation = pipeline::ChromaLocation::Bottom;
+    color.reconstructChroma = true;
+    color.guideChromaWithLuma = color.chromaLocation == pipeline::ChromaLocation::Bottom;
+    return true;
+}
+
+// Some native pins drop the color flags in ConnectionMediaType even though
+// GetFormat supplied them for that very connection. Recover only missing SDR
+// fields from the same byte layout. Explicit connected fields still win.
+inline bool retainConfiguredSdrColor(CaptureMediaLayout& connected, const CaptureMediaLayout& configured) {
+    if (!(configured.colorControlFlags & AMCONTROL_COLORINFO_PRESENT) ||
+        connected.format != configured.format || connected.packing != configured.packing ||
+        connected.width != configured.width || connected.height != configured.height ||
+        connected.stride != configured.stride || connected.sampleBytes != configured.sampleBytes ||
+        connected.duration != configured.duration || connected.bottomUp != configured.bottomUp ||
+        connected.color.isHdrPath() || configured.color.isHdrPath()) return false;
+
+    auto& color = connected.color;
+    const auto& source = configured.color;
+    const auto retain = [](auto& value, bool& assumed, auto configuredValue, bool configuredAssumed) {
+        if (!assumed || configuredAssumed || configuredValue == decltype(configuredValue){}) return false;
+        value = configuredValue;
+        assumed = false;
+        return true;
+    };
+    bool retained = retain(color.range, color.rangeAssumed, source.range, source.rangeAssumed);
+    retained |= retain(color.matrix, color.matrixAssumed, source.matrix, source.matrixAssumed);
+    retained |= retain(color.primaries, color.primariesAssumed, source.primaries, source.primariesAssumed);
+    if (color.chromaLocation == pipeline::ChromaLocation::Unknown && source.chromaLocation != pipeline::ChromaLocation::Unknown) {
+        color.chromaLocation = source.chromaLocation;
+        retained = true;
+    }
+    if (retain(color.transfer, color.transferAssumed, source.transfer, source.transferAssumed)) {
+        color.preserveSdrCodeValues = source.preserveSdrCodeValues;
+        retained = true;
+    }
+    return retained;
+}
 // Walk the AM_MEDIA_TYPE's format block without assuming VideoInfo vs
 // VideoInfo2; used to read/rewrite the DIB orientation flag in place.
 inline BITMAPINFOHEADER* captureBitmapHeader(AM_MEDIA_TYPE& type){

@@ -3228,7 +3228,12 @@ bool EnhanceGraph::process(const AVFrame* frame, double ptsMs, bool reset, Frame
     if(resolved.isHdrPath()&&!resolved.scRgb&&(resolved.matrix!=YuvMatrix::BT2020NCL||resolved.primaries!=ColorPrimaries::BT2020)){
         veyra::log::error("hdr","Unsupported PQ/HLG colorimetry: requires signaled/fallback BT2020 NCL and BT2020 primaries");return false;
     }
-    if(!captureWarmup&&(reset||!realFrameIndex_))veyra::log::info("color",std::format("range={} assumed={} matrix={} assumed={} transfer={} assumed={} display709={} preserveSdrCodes={} workingTransfer={}",int(resolved.range),resolved.rangeAssumed,int(resolved.matrix),resolved.matrixAssumed,int(resolved.transfer),resolved.transferAssumed,resolved.displayReferred709,resolved.preserveSdrCodeValues,workingTransferCode(resolved)));
+    const bool cleanCaptureShadows = desc_.captureShadowDenoise && !desc_.wideYuvInput() &&
+        resolved.range == ColorRange::Limited && !resolved.fullRangeChroma && resolved.matrix == YuvMatrix::BT709 &&
+        resolved.primaries == ColorPrimaries::BT709 && (resolved.transfer == TransferFunction::BT709 || resolved.transfer == TransferFunction::SRGB);
+    const unsigned chromaSite = resolved.reconstructChroma ? std::max(1u, unsigned(resolved.chromaLocation)) : 0u;
+    const bool guideChroma = resolved.guideChromaWithLuma && chromaSite == unsigned(ChromaLocation::Bottom);
+    if(!captureWarmup&&(reset||!realFrameIndex_))veyra::log::info("color",std::format("range={} assumed={} matrix={} assumed={} transfer={} assumed={} display709={} preserveSdrCodes={} workingTransfer={} captureShadowDenoise={} chromaSite={} chromaGuide={}",int(resolved.range),resolved.rangeAssumed,int(resolved.matrix),resolved.matrixAssumed,int(resolved.transfer),resolved.transferAssumed,resolved.displayReferred709,resolved.preserveSdrCodeValues,workingTransferCode(resolved),cleanCaptureShadows,chromaSite,guideChroma));
     if(resolved.isHdrPath()&&!resolved.scRgb&&(reset||!realFrameIndex_)){
         veyra::log::info("hdr-route",std::format("input={} range={} matrix=BT2020-NCL primaries=BT2020 decode={} working={} output={} toneMap={} hdrReferenceWhiteNits=203 hlgReferencePeakNits=1000; SDR workingTransfer field is unused for PQ/HLG",
             resolved.transfer==TransferFunction::HLG?"HLG":"PQ",resolved.range==ColorRange::Full?"full":"limited",
@@ -3562,8 +3567,8 @@ bool EnhanceGraph::process(const AVFrame* frame, double ptsMs, bool reset, Frame
         float constants[12+kColorGradeConstantCount+kDolbyVisionP5ConstantCount] = { resolved.range==ColorRange::Full?0.0f:resolved.fullRangeChroma?2.0f:1.0f,
             resolved.matrix==YuvMatrix::BT2020NCL?2.0f:resolved.matrix==YuvMatrix::BT601?0.0f:1.0f,
             resolved.transfer==TransferFunction::HLG?5.0f:resolved.transfer==TransferFunction::PQ?4.0f:float(workingTransferCode(resolved)), (nv12Texture?(nv12Texture->GetDesc().Format==DXGI_FORMAT_P010?1.0f:0.0f):(desc_.captureBitDepth==16?2.0f:desc_.wideYuvInput()?1.0f:0.0f)),
-            uintBits(srcW_), uintBits(srcH_), uintBits((desc_.hdrWorking()?1u:0u)|(resolved.primaries==ColorPrimaries::BT2020?2u:0u)),
-            uintBits(resolved.reconstructChroma?std::max(1u,unsigned(resolved.chromaLocation)):0u),toneMapPeakNits_,203.0f,0,0 };
+            uintBits(srcW_), uintBits(srcH_), uintBits((desc_.hdrWorking()?1u:0u)|(resolved.primaries==ColorPrimaries::BT2020?2u:0u)|(cleanCaptureShadows?4u:0u)),
+            uintBits(chromaSite | (guideChroma ? 256u : 0u)),toneMapPeakNits_,203.0f,0,0 };
         if(grade)packColorGradeConstants(colorTables_,constants+12);
         // Dolby Vision profile 5: written on every frame because the enable flag
         // lives inside the block, so switching source content back to ordinary

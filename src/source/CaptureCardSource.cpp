@@ -1519,7 +1519,10 @@ bool CaptureCardSource::configureDevice(const SourceOpenDesc& desc) {
         p.layout.color.rangeAssumed=p.layout.color.matrixAssumed=p.layout.color.transferAssumed=true;
         layoutValid=true;
     }else{
-        freeType(native);layoutValid=SUCCEEDED(hr)&&captureMediaLayout(connected,p.layout);freeType(&connected,false);
+        layoutValid=SUCCEEDED(hr)&&captureMediaLayout(connected,p.layout);
+        if(layoutValid&&direct&&retainConfiguredSdrColor(p.layout,nativeLayout))
+            log::info("capture-color","restored missing SDR color metadata from the matching configured native format");
+        freeType(native);freeType(&connected,false);
     }
     if(!layoutValid){log::error("capture",std::format("unsupported negotiated layout/connect failure hr=0x{:08X}",uint32_t(hr)));if(error_.empty())setFailure(L"DirectShow negotiated layout",FAILED(hr)?hr:VFW_E_INVALIDMEDIATYPE);return false;}
     if(p.cpuUnpack&&captureLegacyCpuLayout(p.layout))log::warn("capture-unpack",std::format("legacy CPU unpack path active packing={} format={} (per-pixel conversion stays on the callback thread)",int(p.layout.packing),int(p.layout.format)));
@@ -1556,6 +1559,12 @@ bool CaptureCardSource::configureDevice(const SourceOpenDesc& desc) {
     // Remote Play asked for this; OBS filters capture chroma bilinearly too.
     // Packed 4:2:2 formats interpolate in their own ingress shaders.
     p.layout.color.reconstructChroma=true;
+    const auto reportedSite = p.layout.color.chromaLocation;
+    if (!compressedPath && configureDx20rChroma(p.layout, deviceName, devicePath)) {
+        log::info("capture-chroma", std::format("DX20R NV12 site={} source={} lumaGuide={}",
+            int(p.layout.color.chromaLocation), reportedSite == pipeline::ChromaLocation::Unknown ? "calibration" : "metadata",
+            p.layout.color.guideChromaWithLuma));
+    }
     p.info={};p.info.kind=pipeline::SourceKind::CaptureCard;p.info.width=p.layout.width;p.info.height=p.layout.height;p.info.displayAspect=p.layout.height>0?double(p.layout.width)/p.layout.height:0.0;p.info.averageFps=p.layout.duration>0?1e7/p.layout.duration:0;p.info.duration=pipeline::Rational::unknown();p.info.color=p.layout.color;
     if(expectedFps>0){
         const bool accepted=captureFrameRateMatches(expectedFps,p.layout.duration);

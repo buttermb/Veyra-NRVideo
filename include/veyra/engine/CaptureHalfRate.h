@@ -31,7 +31,7 @@ public:
     static constexpr unsigned kSecondCopies=3;
     // Same hitch window as ContentDedup at a 30 fps cadence: 2.5 periods = 5 slots.
     static constexpr unsigned kHitchSlots=5;
-    void reset(){anchored_=false;havePicture_=false;previousNew_=false;shift_=false;secondCopies_=0;lastSequence_=nextSequence_=0;keptValid_=holding_=waiting_=false;}
+    void reset(){anchored_=false;havePicture_=false;previousNew_=false;shift_=false;secondCopies_=repeatedKeeps_=0;lastSequence_=nextSequence_=0;keptValid_=holding_=waiting_=false;}
     bool setSkipRepeats(bool enabled) {
         if(skipRepeats_==enabled)return false;
         skipRepeats_=enabled;
@@ -40,9 +40,13 @@ public:
     }
     static bool supported(double fps){return std::isfinite(fps)&&fps>=59&&fps<=61;}
     // picture: the sample's picture number, nullptr when unknown.
-    bool accept(int64_t pts,int64_t transportInterval,bool boundary,const uint64_t* picture=nullptr,uint64_t sequence=0){
+    bool accept(int64_t pts,int64_t transportInterval,bool boundary,const uint64_t* picture=nullptr,uint64_t sequence=0,bool fixedCadence=false){
         if(transportInterval<=0){reset();return true;}
         const bool repeat=picture&&havePicture_&&*picture==lastPicture_;
+        // With fixed-cadence 2X output, a slow animation still needs its regular
+        // input slots. Only a sustained still can shift that grid on its first change.
+        const bool heldStill=fixedCadence?repeatedKeeps_>=kHitchSlots:holding_;
+        const bool resumedFromHold=heldStill&&keptValid_&&havePicture_&&lastPicture_==keptPicture_&&picture&&*picture!=keptPicture_;
         const bool adjacent=sequence&&lastSequence_?sequence==lastSequence_+1:
             anchored_&&pts>last_&&pts-last_>=transportInterval*3/4&&pts-last_<=transportInterval*5/4;
         const bool secondCopy=repeat&&previousNew_&&adjacent;
@@ -52,19 +56,21 @@ public:
         lastSequence_=sequence;
         if(boundary||!anchored_||sequenceRestart||pts<last_||pts-last_>transportInterval*6){
             anchored_=true;next_=pts+transportInterval*2;nextSequence_=sequence?sequence+2:0;last_=pts;shift_=false;secondCopies_=0;
-            holding_=waiting_=false;kept(pts,picture,sequence);return true;
+            keptValid_=holding_=waiting_=false;repeatedKeeps_=0;kept(pts,picture,sequence);return true;
         }
         last_=pts;
         if(sequence&&!nextSequence_)nextSequence_=sequence;
         const bool beforeDue=sequence?sequence<nextSequence_:pts+transportInterval/4<next_;
         if(beforeDue){
-            if(!shift_||!picture||repeat||!adjacent)return false;
-            // The first copy of the next picture: move the grid onto it.
+            if((!shift_&&!resumedFromHold)||!picture||repeat||!adjacent)return false;
+            // The preceding keep during a confirmed still was a duplicate. The
+            // first changed callback can start the next pair immediately.
+            if(resumedFromHold)++earlyResumes_;
             shift_=false;secondCopies_=0;next_=pts+transportInterval*2;nextSequence_=sequence?sequence+2:0;++shifts_;
             holding_=false;kept(pts,picture,sequence);return true;
         }
         const bool repeatOfKept=picture&&keptValid_&&*picture==keptPicture_;
-        if(skipRepeats_&&repeatOfKept&&!holding_){
+        if(skipRepeats_&&repeatOfKept&&!holding_&&!fixedCadence){
             const bool withinHitch=sequence&&keptSequence_?sequence-keptSequence_<kHitchSlots:
                 pts-keptPts_+transportInterval/4<transportInterval*int64_t(kHitchSlots);
             // Due, but the game has not drawn a new picture yet: wait for it.
@@ -99,14 +105,17 @@ public:
     // repeated pictures held by the selected policy.
     uint64_t repeatsSkipped()const{return repeatsSkipped_;}
     uint64_t repeatsHeld()const{return held_;}
+    uint64_t earlyResumes()const{return earlyResumes_;}
 private:
     void kept(int64_t pts,const uint64_t* picture,uint64_t sequence){
+        if(picture&&keptValid_&&keptPicture_==*picture){if(repeatedKeeps_<kHitchSlots)++repeatedKeeps_;}
+        else repeatedKeeps_=0;
         keptValid_=picture!=nullptr;if(picture)keptPicture_=*picture;keptPts_=pts;keptSequence_=sequence;
     }
     bool anchored_=false,havePicture_=false,previousNew_=false,shift_=false;int64_t next_=0,last_=0;
     uint64_t lastSequence_=0,nextSequence_=0;
-    uint64_t lastPicture_=0,shifts_=0,grid_=0,secondKept_=0;unsigned secondCopies_=0;
+    uint64_t lastPicture_=0,shifts_=0,grid_=0,secondKept_=0;unsigned secondCopies_=0,repeatedKeeps_=0;
     bool skipRepeats_=true,keptValid_=false,holding_=false,waiting_=false;
-    uint64_t keptPicture_=0,keptSequence_=0,repeatsSkipped_=0,held_=0;int64_t keptPts_=0;
+    uint64_t keptPicture_=0,keptSequence_=0,repeatsSkipped_=0,held_=0,earlyResumes_=0;int64_t keptPts_=0;
 };
 }

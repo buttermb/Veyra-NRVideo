@@ -56,6 +56,49 @@ int main(){
     auto resolved=pipeline::resolveFrameColor(*frame,layout.color);check(resolved.transfer==pipeline::TransferFunction::SRGB&&resolved.transferAssumed&&resolved.range==pipeline::ColorRange::Full,"source contract survives graph resolution");
     ext.VideoTransferFunction=DXVA2_VideoTransFunc_709;vi.dwControlFlags=ext.value|AMCONTROL_COLORINFO_PRESENT;
     check(source::captureMediaLayout(type,layout)&&layout.color.preserveSdrCodeValues&&!layout.color.transferAssumed&&pipeline::workingTransferCode(layout.color)==1,"explicit BT709 metadata retained; working decode reverses the SDR sink encode");
+    const auto configuredSdr = layout;
+    vi.dwControlFlags = 0;
+    source::CaptureMediaLayout connectedSdr;
+    check(source::captureMediaLayout(type,connectedSdr)&&source::retainConfiguredSdrColor(connectedSdr,configuredSdr)&&
+        connectedSdr.color.range==pipeline::ColorRange::Full&&!connectedSdr.color.rangeAssumed&&
+        connectedSdr.color.matrix==pipeline::YuvMatrix::BT709&&connectedSdr.color.preserveSdrCodeValues,
+        "a native pin with missing flags keeps the same format's configured SDR range and matrix");
+    const auto recoveredSdr = connectedSdr;
+    connectedSdr.color.range = pipeline::ColorRange::Limited;
+    check(!source::retainConfiguredSdrColor(connectedSdr,configuredSdr)&&
+        connectedSdr.color.range==pipeline::ColorRange::Limited,"configured flags cannot override explicit connected SDR range");
+    connectedSdr = recoveredSdr;
+    connectedSdr.color.rangeAssumed = true;
+    ++connectedSdr.stride;
+    check(!source::retainConfiguredSdrColor(connectedSdr,configuredSdr),"different native layouts cannot borrow SDR metadata");
+    {
+        auto connected = recoveredSdr, configured = configuredSdr;
+        connected.color.chromaLocation = pipeline::ChromaLocation::Unknown;
+        configured.color.chromaLocation = pipeline::ChromaLocation::Center;
+        check(source::retainConfiguredSdrColor(connected,configured) && connected.color.chromaLocation==pipeline::ChromaLocation::Center,
+              "an untagged connection retains its own negotiated chroma site");
+        connected.color.chromaLocation = pipeline::ChromaLocation::Left;
+        source::retainConfiguredSdrColor(connected,configured);
+        check(connected.color.chromaLocation==pipeline::ChromaLocation::Left,"explicit connected chroma site takes priority");
+
+        source::CaptureMediaLayout mode{};
+        mode.packing=source::CapturePacking::Nv12;mode.format=AV_PIX_FMT_NV12;
+        mode.width=2560;mode.height=1440;mode.duration=166833;
+        mode.color.matrix=pipeline::YuvMatrix::BT709;mode.color.range=pipeline::ColorRange::Limited;
+        constexpr auto name=L"DX20R Video Device", path=L"usb#VID_2D42&PID_0001&MI_00";
+        auto saved=mode;
+        check(source::configureDx20rChroma(saved,name,path) && saved.color.chromaLocation==pipeline::ChromaLocation::Bottom &&
+              saved.color.reconstructChroma && saved.color.guideChromaWithLuma, "untagged DX20R native 59.94 uses calibrated colour reconstruction");
+        saved=mode;saved.color.chromaLocation=pipeline::ChromaLocation::TopLeft;
+        check(source::configureDx20rChroma(saved,name,path) && saved.color.chromaLocation==pipeline::ChromaLocation::TopLeft &&
+              saved.color.reconstructChroma && !saved.color.guideChromaWithLuma, "explicit DX20R site keeps its declared geometry");
+        check(!source::configureDx20rChroma(mode,name,L"usb#vid_1234&pid_0001&mi_00") && !mode.color.reconstructChroma,
+              "a different device sharing the friendly name does not inherit the calibration");
+        saved=mode;saved.duration=333333;
+        check(!source::configureDx20rChroma(saved,name,path), "uncalibrated frame intervals keep the standard path");
+        saved=mode;saved.color.transfer=pipeline::TransferFunction::PQ;
+        check(!source::configureDx20rChroma(saved,name,path), "SDR sampling calibration excludes HDR");
+    }
     ext.VideoTransferFunction=DXVA2_VideoTransFunc_Unknown;
     ext.NominalRange=DXVA2_NominalRange_48_208;vi.dwControlFlags=ext.value|AMCONTROL_COLORINFO_PRESENT;check(!source::captureMediaLayout(type,layout),"unsupported range fails closed");vi.dwControlFlags=0;
     vi.bmiHeader.biWidth=3;check(!source::captureMediaLayout(type,layout),"odd YUY2 width rejected");vi.bmiHeader.biWidth=4;

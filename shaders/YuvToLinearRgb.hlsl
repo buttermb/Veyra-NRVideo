@@ -9,7 +9,7 @@
 cbuffer YuvParams : register(b0)
 {
     float4 colorParams0; // x=range (0 full, 1 limited, 2 limited luma/full chroma) y=matrix z=transfer w=bit depth class
-    uint4 yuvDimensions; // x=width y=height z=bit0 nativeHDR, bit1 BT2020 primaries; w=chroma location
+    uint4 yuvDimensions; // xy=extent, z=HDR/primaries/shadow flags, w=chroma location (low 8 bits) + luma guidance (bit 8)
     float4 toneMapParams; // x=validated source peak nits, y=SDR target peak nits
                           // Custom: z=exposure in EV, w=shoulder (1.0 = the
                           // previous fixed knee). z/w were unused before.
@@ -144,9 +144,24 @@ float3 DoviP5ToPqBt2020(float luma,float2 chroma)
     return NitsToPq(mul(float3x3(dv3.xyz,dv4.xyz,dv5.xyz),PqToNits(pq)));
 }
 
-float2 ReconstructChroma(uint2 pixel)
+// Average luma over the footprint of a bottom-centred 4:2:0 colour sample.
+// Use the visible extent so padding never contributes at the right/bottom edge.
+float BottomChromaLuma(int2 cell)
 {
-    uint location=yuvDimensions.w;
+    int2 last = int2(yuvDimensions.xy) - 1;
+    int2 p = cell * 2 + int2(0, 1);
+    int2 left = min(p, last), right = min(p + int2(1, 0), last);
+    const int top = max(p.y - 1, 0), bottom = min(p.y + 1, last.y);
+    float middle = lumaPlane[left] + lumaPlane[right];
+    float outside = lumaPlane[int2(left.x, top)] + lumaPlane[int2(right.x, top)]
+                  + lumaPlane[int2(left.x, bottom)] + lumaPlane[int2(right.x, bottom)];
+    return (middle * 2.0 + outside) * 0.125;
+}
+
+float2 ReconstructChroma(uint2 pixel, float y, bool guide, out float2 detail)
+{
+    detail = 0.0;
+    uint location=yuvDimensions.w & 255u;
     if(location==0)return chromaPlane[pixel/2];
     // Chroma sample origin in luma pixel-center coordinates. Respect MPEG
     // left, JPEG center and vertical top/bottom placement; no luma filtering.
@@ -160,11 +175,76 @@ float2 ReconstructChroma(uint2 pixel)
     int2 base=int2(floor(position));float2 fraction=frac(position);
     // Clamp to the visible chroma extent, not decoder allocation padding.
     int2 last=int2((yuvDimensions.xy+1)/2)-1;
-    float2 a=chromaPlane[clamp(base,int2(0,0),last)];
-    float2 b=chromaPlane[clamp(base+int2(1,0),int2(0,0),last)];
-    float2 c=chromaPlane[clamp(base+int2(0,1),int2(0,0),last)];
-    float2 d=chromaPlane[clamp(base+int2(1,1),int2(0,0),last)];
-    return lerp(lerp(a,b,fraction.x),lerp(c,d,fraction.x),fraction.y);
+    int2 p0=clamp(base,int2(0,0),last), p1=clamp(base+int2(1,0),int2(0,0),last);
+    int2 p2=clamp(base+int2(0,1),int2(0,0),last), p3=clamp(base+int2(1,1),int2(0,0),last);
+    float2 a=chromaPlane[p0], b=chromaPlane[p1], c=chromaPlane[p2], d=chromaPlane[p3];
+    float2 uv=lerp(lerp(a,b,fraction.x),lerp(c,d,fraction.x),fraction.y);
+    if (guide && location == 6u) {
+        const float2 lo = min(min(a,b),min(c,d)), hi = max(max(a,b),max(c,d));
+        if (max(hi.x-lo.x,hi.y-lo.y) > 4.0/255.0) {
+            const float4 g = float4(BottomChromaLuma(p0), BottomChromaLuma(p1),
+                                    BottomChromaLuma(p2), BottomChromaLuma(p3));
+            const float4 dy = g - (g.x+g.y+g.z+g.w)*0.25;
+            const float2 mean = (a+b+c+d)*0.25;
+            const float2 da=a-mean, db=b-mean, dc=c-mean, dd=d-mean;
+            const float2 cov = dy.x*da + dy.y*db + dy.z*dc + dy.w*dd;
+            const float varY = dot(dy,dy);
+            const float varC = dot(da,da)+dot(db,db)+dot(dc,dc)+dot(dd,dd);
+            // A weak or unrelated luma edge must not print texture into colour.
+            const float varFloor = 16.0/(255.0*255.0);
+            const float confidence = smoothstep(0.45,0.9,dot(cov,cov)/max(varY*varC,1e-12));
+            const float baseY = lerp(lerp(g.x,g.y,fraction.x),lerp(g.z,g.w,fraction.x),fraction.y);
+            const float2 predicted = uv + cov*((y-baseY)/(varY+varFloor));
+            detail = confidence*(clamp(predicted,lo,hi)-uv);
+        }
+    }
+    return uv;
+}
+
+float2 ReconstructChroma(uint2 pixel)
+{
+    float2 unused;
+    return ReconstructChroma(pixel, 0.0, false, unused);
+}
+
+// Work in the card's 8-bit limited-range codes before grading and super-resolution.
+// Opposite samples cancel on a smooth ramp. Reject a pair if it spans an edge
+// or if its endpoints both differ substantially from the centre (a thin line).
+float ShadowPairWeight(float difference)
+{
+    return 1.0 - smoothstep(2.0 / 255.0, 7.0 / 255.0, difference);
+}
+
+void DenoiseCaptureShadows(int2 p, inout float y, inout float2 uv)
+{
+    const float strength = 1.0 - smoothstep(42.0 / 255.0, 72.0 / 255.0, y);
+    if (strength <= 0.0) return;
+    const int2 last = int2(yuvDimensions.xy) - 1;
+    const int2 axes[4] = {int2(1, 0), int2(0, 1), int2(1, 1), int2(1, -1)};
+    float yDelta = 0.0, yWeight = 2.0;
+    [unroll] for (int i = 0; i < 4; ++i) {
+        const float a = lumaPlane[clamp(p - axes[i], int2(0, 0), last)] - y;
+        const float b = lumaPlane[clamp(p + axes[i], int2(0, 0), last)] - y;
+        const float w = ShadowPairWeight(max(abs(a - b), max(abs(a), abs(b))));
+        yDelta += w * (a + b);
+        yWeight += 2.0 * w;
+    }
+    y += 0.90 * strength * yDelta / yWeight;
+
+    // One chroma texel is two luma pixels. Sample at equal offsets from the
+    // original chroma phase, with a shared weight for Cb and Cr to retain hue.
+    float2 uvDelta = 0.0;
+    float uvWeight = 1.0;
+    [unroll] for (int i = 0; i < 2; ++i) {
+        const int2 step = 2 * axes[i];
+        const float2 a = ReconstructChroma(uint2(clamp(p - step, int2(0, 0), last))) - uv;
+        const float2 b = ReconstructChroma(uint2(clamp(p + step, int2(0, 0), last))) - uv;
+        const float2 span = max(abs(a - b), max(abs(a), abs(b)));
+        const float w = ShadowPairWeight(max(span.x, span.y));
+        uvDelta += w * (a + b);
+        uvWeight += 2.0 * w;
+    }
+    uv += 0.85 * strength * uvDelta / uvWeight;
 }
 
 
@@ -350,8 +430,16 @@ void main(uint3 dispatchThreadId : SV_DispatchThreadID)
     if (dispatchThreadId.x >= yuvDimensions.x || dispatchThreadId.y >= yuvDimensions.y) {
         return;
     }
-    const float y = lumaPlane[uint2(dispatchThreadId.x, dispatchThreadId.y)];
-    const float2 uv = ReconstructChroma(dispatchThreadId.xy);
+    float y = lumaPlane[dispatchThreadId.xy];
+    float2 chromaDetail;
+    float2 uv = ReconstructChroma(dispatchThreadId.xy, y, (yuvDimensions.w & 256u) != 0, chromaDetail);
+    const float2 edgeTarget = uv + chromaDetail;
+    if ((yuvDimensions.z & 4u) != 0) {
+        DenoiseCaptureShadows(int2(dispatchThreadId.xy), y, uv);
+        uv += clamp(edgeTarget - uv, min(chromaDetail, 0.0), max(chromaDetail, 0.0));
+    } else {
+        uv = edgeTarget;
+    }
     // Custom (P7): dv6.w == 2 rebuilds the 12-bit signal from base + enhancement
     // before the colour conversion; dv6.w == 1 is the profile 5 conversion.
     // dv6.w == 2 reconstructs; dv6.w == 3 reconstructs and shows the gap instead.

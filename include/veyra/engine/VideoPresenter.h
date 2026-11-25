@@ -42,7 +42,7 @@ public:
     static bool prepareOpening(gfx::D3D12DeviceContext&,pipeline::EnhanceGraph&,PreparedOpening&);
     bool open(gfx::D3D12DeviceContext&, HWND, pipeline::EnhanceGraph&, bool captureCompatible=false,
               bool mediaClockPaced=false,std::unique_ptr<PreparedOpening> prepared={},HWND temporarySurface=nullptr);
-    bool present(gfx::D3D12DeviceContext&,gfx::CommandSlotRing&,pipeline::EnhanceGraph&,unsigned slot,bool generated,bool referencesValid=true,int comparison=0,bool baseReference=false,float split=.5f,pipeline::FrameIdentity identity={},PreviewView view={},int64_t sourcePts100ns=-1,bool retainUnchanged=false);
+    bool present(gfx::D3D12DeviceContext&,gfx::CommandSlotRing&,pipeline::EnhanceGraph&,unsigned slot,bool generated,bool referencesValid=true,int comparison=0,bool baseReference=false,float split=.5f,pipeline::FrameIdentity identity={},PreviewView view={},int64_t sourcePts100ns=-1,bool retainUnchanged=false,int64_t captureCallback100ns=0);
     void close();
     // Owner-thread graph replacement boundary. Native DXGI remains attached to
     // its HWND; provider-owned presentation must be shut down before its graph.
