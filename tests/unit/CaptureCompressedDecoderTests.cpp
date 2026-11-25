@@ -691,10 +691,10 @@ int wmain(int argc, wchar_t** argv)
             "10-bit HEVC compressed input exposes P010 in the hardware backend");
     }
     if(argc>3){
-        ElementaryStream small;std::string smallError;
+        ElementaryStream smallStream;std::string smallError;
         const auto utf8Small=std::filesystem::path(argv[3]).u8string();
         const std::string smallStorage(utf8Small.begin(),utf8Small.end());
-        check(loadAnnexB(smallStorage.c_str(),small,smallError)&&unsupportedHardwareExtentFallbackTest(small,context),
+        check(loadAnnexB(smallStorage.c_str(),smallStream,smallError)&&unsupportedHardwareExtentFallbackTest(smallStream,context),
             "unsupported hardware extent falls back to software without losing deep input");
     }
     // B-frame reordering may emit a slightly different count on the software
