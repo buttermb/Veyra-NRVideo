@@ -158,7 +158,7 @@ bool reconstructedCaptureChroma(gfx::D3D12DeviceContext& ctx,gfx::CommandSlotRin
         ColorDescription color;
         color.pixelFormat=spec.color;color.range=ColorRange::Limited;color.matrix=YuvMatrix::BT709;
         color.transfer=TransferFunction::SRGB;
-        color.reconstructChroma=planar;color.chromaLocation=ChromaLocation::TopLeft;
+        enableCaptureChromaReconstruction(color);color.chromaLocation=ChromaLocation::TopLeft;
         EnhanceGraph graph(ctx,ring);EnhanceGraph::FrameOutputs out;
         sink::RgbaImage pixels;
         const bool rendered=graph.initialize(desc)&&graph.createViews()&&graph.process(frame,0,true,out,1,&color)&&
