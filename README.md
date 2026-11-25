@@ -1,3 +1,7 @@
+## PS5 Capture Community Edition for Windows
+
+Capture a PS5 over HDMI with source-resolution Video Denoise, NVIDIA Image Scaling, and a 60 fps frame-generation preset. Extract the Windows ZIP and double-click **Veyra.exe**. On first use it downloads the verified upstream NVIDIA runtime and opens the capture controls. [Download the community release](https://github.com/buttermb/Veyra-NRVideo/releases/tag/v2.2.1-ps5-nis.1) · [Setup and tested settings](packaging/ps5-community/README.md)
+
 <div align="center">
 
 <img src="assets/veyra-wordmark-sun.gif" alt="Veyra NR · transparent animated wordmark and sun" width="480">
