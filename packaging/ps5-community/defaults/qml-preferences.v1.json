@@ -1,8 +1,11 @@
 {
   "aspect": 3,
   "autoResume": true,
+  "cinePillHidden": true,
   "contentRate": 5,
   "hudProtect": 1,
+  "lastPage": "pro",
+  "pacingRepair": true,
   "presentation": {
     "customFps": 60,
     "display": 1,
@@ -10,5 +13,6 @@
     "nvidiaLowLatency": 1,
     "outputRate": 1,
     "vrr": false
-  }
+  },
+  "volume": 2.524390243902439
 }
